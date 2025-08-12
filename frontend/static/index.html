@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Congress Bill Stats</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="container">
+    <header class="mb">
+      <h1 class="h1">Congress Bill Stats</h1>
+      <p class="muted">Counts of bills sponsored and enacted (became law) by legislator. Data: Congress.gov API.</p>
+    </header>
+
+    <section class="controls">
+      <div class="control">
+        <label>Congress</label>
+        <input id="congressInput" type="number" min="81" value="119">
+      </div>
+      <div class="control">
+        <label>Chamber</label>
+        <select id="chamberFilter">
+          <option value="both">Both</option>
+          <option value="house">House</option>
+          <option value="senate">Senate</option>
+        </select>
+      </div>
+      <div class="control">
+        <label>Search (name/state)</label>
+        <input id="searchBox" type="text" placeholder="e.g., Smith or IL">
+      </div>
+      <div class="control buttons">
+        <button id="loadBtn" class="btn">Load / Refresh</button>
+        <button id="exportBtn" class="btn secondary">Export CSV</button>
+      </div>
+    </section>
+
+    <div id="status" class="muted mb"></div>
+
+    <div class="card">
+      <table id="dataTable">
+        <thead>
+          <tr>
+            <th data-key="sponsorName" class="th-sort">Legislator</th>
+            <th data-key="chamber" class="th-sort">Chamber</th>
+            <th data-key="party" class="th-sort">Party</th>
+            <th data-key="state" class="th-sort">State</th>
+            <th data-key="sponsored_total" class="th-sort right">Sponsored</th>
+            <th data-key="enacted_total" class="th-sort right">Became Law</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+
+    <p class="tiny muted">
+      “Became Law” uses Congress.gov action codes for enacted public/private laws. First load may take a few minutes; then it’s cached.
+    </p>
+  </div>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
