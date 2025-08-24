@@ -27,3 +27,6 @@ build/
 
 node_modules/
 
+# Ignore HTTP cache files generated at runtime
+backend/cache/http/
+

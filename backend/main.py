@@ -1,6 +1,8 @@
 import os
 import time
 import json
+import hashlib
+import urllib.parse
 from typing import Dict, Any, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -21,6 +23,10 @@ DEFAULT_CONGRESS = int(os.environ.get("DEFAULT_CONGRESS", "119"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))  # parallel page fetchers
 
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Cache directory for raw API responses
+HTTP_CACHE_DIR = os.path.join(CACHE_DIR, "http")
+os.makedirs(HTTP_CACHE_DIR, exist_ok=True)
 
 # Action codes that indicate a bill became law (public or private).
 # Source: Congress.gov action codes (public law 36000–39999; private law 41000–44999)
@@ -86,14 +92,27 @@ def is_enacted(action_code: Optional[int]) -> bool:
 # -------------------------------
 # HTTP client for Congress.gov
 # -------------------------------
-def api_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """GET helper for Congress.gov API with retries, timeouts, and safe logging."""
+def api_get(path: str, params: Optional[Dict[str, Any]] = None, use_cache: bool = True) -> Dict[str, Any]:
+    """GET helper for Congress.gov API with retries, timeouts, and simple file caching."""
     if not API_KEY:
         raise HTTPException(status_code=500, detail="Missing CONGRESS_API_KEY env var.")
 
     url = f"{API_ROOT.rstrip('/')}/{path.lstrip('/')}"
     headers = {"X-Api-Key": API_KEY, "Accept": "application/json"}
     params = {**(params or {}), "format": "json"}  # ask for JSON; key is in header
+
+    cache_file = None
+    if use_cache:
+        key = f"{url}?{urllib.parse.urlencode(sorted(params.items()))}"
+        name = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        cache_file = os.path.join(HTTP_CACHE_DIR, f"{name}.json")
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    print(f"[http-cache] hit {url}", flush=True)
+                    return json.load(f)
+            except Exception:
+                pass
 
     for attempt in range(3):
         try:
@@ -108,9 +127,16 @@ def api_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any
 
             if resp.status_code == 200:
                 try:
-                    return resp.json()
+                    data = resp.json()
                 except ValueError:
                     raise HTTPException(status_code=502, detail="Invalid JSON from Congress API")
+
+                if cache_file:
+                    tmp = cache_file + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(data, f)
+                    os.replace(tmp, cache_file)
+                return data
 
             if resp.status_code >= 500 and attempt < 2:
                 time.sleep(1.2 * (attempt + 1))
@@ -153,12 +179,12 @@ def _extract_bills(j: Dict[str, Any]) -> List[Dict[str, Any]]:
         return [_normalize_bill_item(it) for it in data]
     return []
 
-def fetch_all_bills_for_congress(congress: int) -> List[Dict[str, Any]]:
+def fetch_all_bills_for_congress(congress: int, use_cache: bool = True) -> List[Dict[str, Any]]:
     """Fetch all bills for a Congress: probe first page, then fetch remaining pages in parallel."""
     limit = 250
 
     # First page
-    first = api_get(f"/bill/{congress}", params={"limit": limit, "offset": 0})
+    first = api_get(f"/bill/{congress}", params={"limit": limit, "offset": 0}, use_cache=use_cache)
     bills: List[Dict[str, Any]] = _extract_bills(first)
     pagination = first.get("pagination") or {}
     total = int(pagination.get("count") or 0)
@@ -176,7 +202,9 @@ def fetch_all_bills_for_congress(congress: int) -> List[Dict[str, Any]]:
     max_workers = int(os.environ.get("MAX_WORKERS", "8"))
 
     def fetch_page(off: int) -> List[Dict[str, Any]]:
-        r = api_get(f"/bill/{congress}", params={"limit": limit, "offset": off})
+        r = api_get(
+            f"/bill/{congress}", params={"limit": limit, "offset": off}, use_cache=use_cache
+        )
         return _extract_bills(r)
 
     fetched = 0
@@ -253,7 +281,9 @@ def _bill_identity(congress: int, b: Dict[str, Any]) -> Optional[str]:
         return f"/bill/{congress}/{typ}/{num}"
     return None
 
-def fetch_primary_sponsor_from_item(congress: int, b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def fetch_primary_sponsor_from_item(
+    congress: int, b: Dict[str, Any], use_cache: bool = True
+) -> Optional[Dict[str, Any]]:
     """
     Fetch the *item* endpoint and extract the first sponsor.
     Item shape (JSON): { "data": { "bill": { "sponsors": { "item": [ ... ] }, "originChamber": ... } } }
@@ -261,7 +291,7 @@ def fetch_primary_sponsor_from_item(congress: int, b: Dict[str, Any]) -> Optiona
     path = _bill_identity(congress, b)
     if not path:
         return None
-    j = api_get(path)
+    j = api_get(path, use_cache=use_cache)
     data = j.get("data") or {}
     bill = data.get("bill") or j.get("bill") or {}
     sponsors = bill.get("sponsors") or {}
@@ -283,9 +313,9 @@ def fetch_primary_sponsor_from_item(congress: int, b: Dict[str, Any]) -> Optiona
 # -------------------------------
 # Member lookup (unchanged, but resilient to shape)
 # -------------------------------
-def fetch_member_snapshot(bioguide_id: str) -> Dict[str, Any]:
+def fetch_member_snapshot(bioguide_id: str, use_cache: bool = True) -> Dict[str, Any]:
     """Get member details to attach chamber/state/party."""
-    resp = api_get(f"/member/{bioguide_id}")
+    resp = api_get(f"/member/{bioguide_id}", use_cache=use_cache)
     data = resp.get("data") or {}
     member = data.get("member") or resp.get("member") or {}
     out = {
@@ -309,9 +339,9 @@ def fetch_member_snapshot(bioguide_id: str) -> Dict[str, Any]:
 # -------------------------------
 # Aggregation (with item-level fallback)
 # -------------------------------
-def build_stats(congress: int) -> Dict[str, Any]:
+def build_stats(congress: int, use_cache: bool = True) -> Dict[str, Any]:
     """Aggregate counts by sponsor from bill list; fetch item details when needed."""
-    raw_bills = fetch_all_bills_for_congress(congress)
+    raw_bills = fetch_all_bills_for_congress(congress, use_cache=use_cache)
 
     # Try list-level sponsor first; fall back to item-level in parallel if missing
     list_level: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
@@ -333,7 +363,10 @@ def build_stats(congress: int) -> Dict[str, Any]:
 
     if need_items:
         with ThreadPoolExecutor(max_workers=detail_workers) as pool:
-            futs = {pool.submit(fetch_primary_sponsor_from_item, congress, b): b for b in need_items}
+            futs = {
+                pool.submit(fetch_primary_sponsor_from_item, congress, b, use_cache): b
+                for b in need_items
+            }
             done = 0
             for fut in as_completed(futs):
                 b = futs[fut]
@@ -384,7 +417,7 @@ def build_stats(congress: int) -> Dict[str, Any]:
         needs = any(rec.get(k) in (None, "", "Unknown") for k in ("party", "state", "chamber", "sponsorName"))
         if needs:
             try:
-                m = fetch_member_snapshot(bioguide)
+                m = fetch_member_snapshot(bioguide, use_cache=use_cache)
                 rec["party"] = rec["party"] or m.get("party")
                 rec["state"] = rec["state"] or m.get("state")
                 rec["chamber"] = rec["chamber"] or m.get("chamber")
@@ -426,7 +459,7 @@ def api_stats(
     if cached:
         return JSONResponse(cached)
 
-    stats = build_stats(congress)
+    stats = build_stats(congress, use_cache=not refresh)
     save_cache(congress, stats)
     return JSONResponse(stats)
 
