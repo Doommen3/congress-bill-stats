@@ -23,11 +23,11 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))  # parallel page fetchers
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Action codes that indicate a bill became law (public or private).
-# Source: Congress.gov action codes (public law ~36000–40000; private law ~41000–45000)
-ENACTED_CODES = {
-    36000, 37000, 38000, 39000, 40000,   # public law
-    41000, 42000, 43000, 44000, 45000    # private law
-}
+# Source: Congress.gov action codes (public law 36000–39999; private law 41000–44999)
+ENACTED_CODE_RANGES = (
+    (36000, 39999),  # public law
+    (41000, 44999),  # private law
+)
 
 app = FastAPI(title="Congress Bill Stats", version="1.0.0")
 
@@ -70,12 +70,18 @@ def save_cache(congress: int, data: Dict[str, Any]) -> None:
     os.replace(tmp, cache_path(congress))
 
 def is_enacted(action_code: Optional[int]) -> bool:
+    """Return True if the action code indicates the bill became law."""
     if action_code is None:
         return False
     try:
-        return int(action_code) in ENACTED_CODES
-    except Exception:
+        code = int(action_code)
+    except (TypeError, ValueError):
         return False
+
+    for start, end in ENACTED_CODE_RANGES:
+        if start <= code <= end:
+            return True
+    return False
 
 # -------------------------------
 # HTTP client for Congress.gov
