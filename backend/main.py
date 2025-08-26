@@ -3,7 +3,7 @@ import time
 import json
 import hashlib
 import urllib.parse
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -283,14 +283,15 @@ def _bill_identity(congress: int, b: Dict[str, Any]) -> Optional[str]:
 
 def fetch_primary_sponsor_from_item(
     congress: int, b: Dict[str, Any], use_cache: bool = True
-) -> Optional[Dict[str, Any]]:
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     """
-    Fetch the *item* endpoint and extract the first sponsor.
+    Fetch the *item* endpoint and extract the first sponsor, returning the full
+    bill object along with sponsor info.
     Item shape (JSON): { "data": { "bill": { "sponsors": { "item": [ ... ] }, "originChamber": ... } } }
     """
     path = _bill_identity(congress, b)
     if not path:
-        return None
+        return b, None
     j = api_get(path, use_cache=use_cache)
     data = j.get("data") or {}
     bill = data.get("bill") or j.get("bill") or {}
@@ -300,14 +301,15 @@ def fetch_primary_sponsor_from_item(
         s0 = items[0] or {}
         bioguide = s0.get("bioguideId") or s0.get("bioguideID") or s0.get("bioguide")
         if bioguide:
-            return {
+            sponsor = {
                 "bioguideId": bioguide,
                 "fullName": s0.get("fullName") or s0.get("name"),
                 "party": s0.get("party"),
                 "state": s0.get("state"),
                 "chamber": s0.get("chamber") or bill.get("originChamber"),
             }
-    return None
+            return bill, sponsor
+    return bill, None
 
 
 # -------------------------------
@@ -343,20 +345,25 @@ def build_stats(congress: int, use_cache: bool = True) -> Dict[str, Any]:
     """Aggregate counts by sponsor from bill list; fetch item details when needed."""
     raw_bills = fetch_all_bills_for_congress(congress, use_cache=use_cache)
 
-    # Try list-level sponsor first; fall back to item-level in parallel if missing
+    # Try list-level sponsor/action code; fall back to item-level if either missing
     list_level: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
     need_items: List[Dict[str, Any]] = []
 
     for b in raw_bills:
         s = extract_primary_sponsor(b)
-        if s:
+        latest = b.get("latestAction") or {}
+        action_code = latest.get("actionCode")
+        if s and action_code is not None:
             list_level.append((b, s))
         else:
             need_items.append(b)
 
-    print(f"[agg] bills={len(raw_bills)} list_level_sponsors={len(list_level)} need_items={len(need_items)}", flush=True)
+    print(
+        f"[agg] bills={len(raw_bills)} list_level_sponsors={len(list_level)} need_items={len(need_items)}",
+        flush=True,
+    )
 
-    # Fetch item-level sponsors in parallel (tune workers to respect rate limits)
+    # Fetch item-level details in parallel when needed (tune workers to respect rate limits)
     from concurrent.futures import ThreadPoolExecutor, as_completed
     detail_workers = int(os.environ.get("DETAIL_WORKERS", "8"))
     item_results: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
@@ -369,15 +376,18 @@ def build_stats(congress: int, use_cache: bool = True) -> Dict[str, Any]:
             }
             done = 0
             for fut in as_completed(futs):
-                b = futs[fut]
+                orig = futs[fut]
                 try:
-                    s = fut.result()
+                    bill_detail, s = fut.result()
                 except Exception:
-                    s = None
-                item_results.append((b, s))
+                    bill_detail, s = orig, None
+                item_results.append((bill_detail, s))
                 done += 1
                 if done % 50 == 0 or done == len(need_items):
-                    print(f"[items] fetched {done}/{len(need_items)} item sponsors", flush=True)
+                    print(
+                        f"[items] fetched {done}/{len(need_items)} item details",
+                        flush=True,
+                    )
 
     # Combine
     pairs = list_level + item_results
