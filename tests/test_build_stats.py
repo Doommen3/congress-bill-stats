@@ -51,5 +51,8 @@ def test_build_stats_counts_enacted(monkeypatch):
     monkeypatch.setattr(main, "api_get", fake_api_get)
 
     stats = main.build_stats(118, use_cache=False)
-    assert stats["rows"][0]["enacted_total"] == 1
-    assert stats["rows"][0]["sponsored_total"] == 1
+    row = stats["rows"][0]
+    assert row["enacted_total"] == 1
+    assert row["public_law_total"] == 1
+    assert row["private_law_total"] == 0
+    assert row["sponsored_total"] == 1

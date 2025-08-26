@@ -42,8 +42,9 @@ uvicorn main:app --reload
 
 ## Notes
 
-- "Became Law" is computed from **action codes** in `latestAction.actionCode`, using Congress.gov’s values for public/private law:
-  36000–40000 (public law) and 41000–45000 (private law).
+- "Became Law" is determined from a bill's `laws.type` ("Public Law" or "Private Law") when available, falling back to the
+  `latestAction.actionCode` ranges 36000–39999 (public law) and 41000–44999 (private law). Counts for public and private laws
+  are provided separately.
 - Counting "passed both chambers" is possible by scanning each bill’s full action history (slower).
 
 ## License
