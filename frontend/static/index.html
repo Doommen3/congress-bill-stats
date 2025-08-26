@@ -11,7 +11,7 @@
   <div class="container">
     <header class="mb">
       <h1 class="h1">Congress Bill Stats</h1>
-      <p class="muted">Counts of bills sponsored and enacted (became law) by legislator. Data: Congress.gov API.</p>
+      <p class="muted">Counts of bills sponsored and enacted (became law) by legislator, with public vs. private law breakdown. Data: Congress.gov API.</p>
     </header>
 
     <section class="controls">
@@ -48,6 +48,8 @@
             <th data-key="party" class="th-sort">Party</th>
             <th data-key="state" class="th-sort">State</th>
             <th data-key="sponsored_total" class="th-sort right">Sponsored</th>
+            <th data-key="public_law_total" class="th-sort right">Public Law</th>
+            <th data-key="private_law_total" class="th-sort right">Private Law</th>
             <th data-key="enacted_total" class="th-sort right">Became Law</th>
           </tr>
         </thead>
@@ -56,7 +58,7 @@
     </div>
 
     <p class="tiny muted">
-      “Became Law” uses Congress.gov action codes for enacted public/private laws. First load may take a few minutes; then it’s cached.
+      “Became Law” relies on each bill’s law type or action codes for public/private laws. First load may take a few minutes; then it’s cached.
     </p>
   </div>
 

@@ -28,11 +28,13 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 HTTP_CACHE_DIR = os.path.join(CACHE_DIR, "http")
 os.makedirs(HTTP_CACHE_DIR, exist_ok=True)
 
-# Action codes that indicate a bill became law (public or private).
+# Action codes that indicate a bill became law.
 # Source: Congress.gov action codes (public law 36000–39999; private law 41000–44999)
+PUBLIC_LAW_RANGE = (36000, 39999)
+PRIVATE_LAW_RANGE = (41000, 44999)
 ENACTED_CODE_RANGES = (
-    (36000, 39999),  # public law
-    (41000, 44999),  # private law
+    PUBLIC_LAW_RANGE,
+    PRIVATE_LAW_RANGE,
 )
 
 app = FastAPI(title="Congress Bill Stats", version="1.0.0")
@@ -75,19 +77,36 @@ def save_cache(congress: int, data: Dict[str, Any]) -> None:
         json.dump(data, f)
     os.replace(tmp, cache_path(congress))
 
-def is_enacted(action_code: Optional[int]) -> bool:
-    """Return True if the action code indicates the bill became law."""
+def law_type_from_action_code(action_code: Optional[int]) -> Optional[str]:
+    """Return 'Public Law' or 'Private Law' based on the action code."""
     if action_code is None:
-        return False
+        return None
     try:
         code = int(action_code)
     except (TypeError, ValueError):
-        return False
+        return None
 
-    for start, end in ENACTED_CODE_RANGES:
-        if start <= code <= end:
-            return True
-    return False
+    if PUBLIC_LAW_RANGE[0] <= code <= PUBLIC_LAW_RANGE[1]:
+        return "Public Law"
+    if PRIVATE_LAW_RANGE[0] <= code <= PRIVATE_LAW_RANGE[1]:
+        return "Private Law"
+    return None
+
+
+def is_enacted(action_code: Optional[int]) -> bool:
+    """Return True if the action code indicates the bill became law."""
+    return law_type_from_action_code(action_code) is not None
+
+
+def get_law_type(bill: Dict[str, Any]) -> Optional[str]:
+    """Determine law type from bill data (item or list level)."""
+    laws = bill.get("laws")
+    if isinstance(laws, dict):
+        t = laws.get("type")
+        if t:
+            return t
+    latest = bill.get("latestAction") or {}
+    return law_type_from_action_code(latest.get("actionCode"))
 
 # -------------------------------
 # HTTP client for Congress.gov
@@ -402,8 +421,7 @@ def build_stats(congress: int, use_cache: bool = True) -> Dict[str, Any]:
             continue
 
         bioguide = sponsor_info["bioguideId"]
-        latest = b.get("latestAction") or {}
-        action_code = latest.get("actionCode")
+        law_type = get_law_type(b)
 
         rec = by_sponsor.get(bioguide)
         if rec is None:
@@ -415,12 +433,18 @@ def build_stats(congress: int, use_cache: bool = True) -> Dict[str, Any]:
                 "chamber": sponsor_info.get("chamber"),
                 "sponsored_total": 0,
                 "enacted_total": 0,
+                "public_law_total": 0,
+                "private_law_total": 0,
             }
             by_sponsor[bioguide] = rec
 
         rec["sponsored_total"] += 1
-        if is_enacted(action_code):
+        if law_type:
             rec["enacted_total"] += 1
+            if law_type == "Public Law":
+                rec["public_law_total"] += 1
+            elif law_type == "Private Law":
+                rec["private_law_total"] += 1
 
     # Enrich any missing meta from the member endpoint (<= 535 lookups worst case)
     for bioguide, rec in by_sponsor.items():
@@ -448,7 +472,8 @@ def build_stats(congress: int, use_cache: bool = True) -> Dict[str, Any]:
         "generated_at": int(time.time()),
         "rows": rows,
         "note": (
-            "“Became Law” counts bills where latestAction.actionCode indicates a public or private law. "
+            "“Became Law” counts bills where the bill's laws.type is 'Public Law' or 'Private Law' "
+            "or latestAction.actionCode falls in those ranges. Public and private law totals are provided separately. "
             "Sponsors are taken from list level when present, otherwise from the bill item’s sponsors.item[0]."
         ),
     }

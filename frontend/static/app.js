@@ -51,6 +51,8 @@ function render() {
       <td>${r.party || '—'}</td>
       <td>${r.state || '—'}</td>
       <td class="right">${fmt(r.sponsored_total || 0)}</td>
+      <td class="right">${fmt(r.public_law_total || 0)}</td>
+      <td class="right">${fmt(r.private_law_total || 0)}</td>
       <td class="right">${fmt(r.enacted_total || 0)}</td>
     </tr>
   `).join('');
@@ -85,7 +87,8 @@ headers.forEach(th => {
       sortDir = sortDir === 'asc' ? 'desc' : 'asc';
     } else {
       sortKey = key;
-      sortDir = (key === 'sponsored_total' || key === 'enacted_total') ? 'desc' : 'asc';
+      sortDir = (key === 'sponsored_total' || key === 'enacted_total' ||
+                 key === 'public_law_total' || key === 'private_law_total') ? 'desc' : 'asc';
     }
     render();
   });
