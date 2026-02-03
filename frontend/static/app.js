@@ -1,4 +1,5 @@
 const statusEl = document.getElementById('status');
+const summaryEl = document.getElementById('summary');
 const tableBody = document.getElementById('tbody');
 const chamberFilter = document.getElementById('chamberFilter');
 const searchBox = document.getElementById('searchBox');
@@ -8,6 +9,7 @@ const exportBtn = document.getElementById('exportBtn');
 const headers = document.querySelectorAll('.th-sort');
 
 let currentData = [];
+let currentSummary = null;
 let sortKey = 'sponsored_total';
 let sortDir = 'desc';
 
@@ -51,19 +53,32 @@ function render() {
       <td>${r.party || '—'}</td>
       <td>${r.state || '—'}</td>
       <td class="right">${fmt(r.sponsored_total || 0)}</td>
-      <td class="right">${fmt(r.public_law_total || 0)}</td>
-      <td class="right">${fmt(r.private_law_total || 0)}</td>
+      <td class="right">${fmt(r.public_law_count || 0)}</td>
+      <td class="right">${fmt(r.private_law_count || 0)}</td>
       <td class="right">${fmt(r.enacted_total || 0)}</td>
     </tr>
   `).join('');
+
+  // Update summary if available
+  if (currentSummary) {
+    summaryEl.innerHTML = `
+      <strong>Summary:</strong> ${fmt(currentSummary.total_bills || 0)} bills |
+      ${fmt(currentSummary.total_laws || 0)} enacted laws
+      (${fmt(currentSummary.public_laws || 0)} public, ${fmt(currentSummary.private_laws || 0)} private) |
+      ${fmt(currentSummary.total_legislators || 0)} legislators
+    `;
+  } else {
+    summaryEl.innerHTML = '';
+  }
 }
 
-async function loadData() {
+async function loadData(forceRefresh = false) {
   const congress = parseInt(congressInput.value || '119', 10);
   setStatus('Loading (first run may take a few minutes)…');
   loadBtn.disabled = true; loadBtn.textContent = 'Loading…';
   try {
-    const r = await fetch(`/api/stats?congress=${encodeURIComponent(congress)}`);
+    const refreshParam = forceRefresh ? '&refresh=true' : '';
+    const r = await fetch(`/api/stats?congress=${encodeURIComponent(congress)}${refreshParam}`);
     if (!r.ok) {
       const t = await r.text();
       setStatus('Error: ' + t.slice(0, 300));
@@ -71,7 +86,11 @@ async function loadData() {
     }
     const json = await r.json();
     currentData = json.rows || [];
-    setStatus(`Loaded ${currentData.length} legislators for the ${json.congress}th Congress.`);
+    currentSummary = json.summary || null;
+
+    // Format the generated_at timestamp
+    const genTime = json.generated_at ? new Date(json.generated_at * 1000).toLocaleString() : 'unknown';
+    setStatus(`Loaded ${currentData.length} legislators for the ${json.congress}th Congress. Data as of: ${genTime}`);
     render();
   } catch (e) {
     setStatus('Network error: ' + (e && e.message ? e.message : e));
@@ -87,14 +106,57 @@ headers.forEach(th => {
       sortDir = sortDir === 'asc' ? 'desc' : 'asc';
     } else {
       sortKey = key;
-      sortDir = (key === 'sponsored_total' || key === 'enacted_total' ||
-                 key === 'public_law_total' || key === 'private_law_total') ? 'desc' : 'asc';
+      // Default to descending for numeric columns
+      const numericCols = ['sponsored_total', 'enacted_total', 'public_law_count', 'private_law_count'];
+      sortDir = numericCols.includes(key) ? 'desc' : 'asc';
     }
     render();
   });
 });
 
+function exportCSV() {
+  if (!currentData.length) {
+    alert('No data to export. Please load data first.');
+    return;
+  }
+
+  const headers = ['Legislator', 'Chamber', 'Party', 'State', 'Sponsored', 'Public Laws', 'Private Laws', 'Total Laws'];
+  const rows = currentData.map(r => [
+    r.sponsorName || '',
+    r.chamber || '',
+    r.party || '',
+    r.state || '',
+    r.sponsored_total || 0,
+    r.public_law_count || 0,
+    r.private_law_count || 0,
+    r.enacted_total || 0,
+  ]);
+
+  const csvContent = [
+    headers.join(','),
+    ...rows.map(row => row.map(cell => {
+      // Escape quotes and wrap in quotes if contains comma
+      const str = String(cell);
+      if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+        return '"' + str.replace(/"/g, '""') + '"';
+      }
+      return str;
+    }).join(','))
+  ].join('\n');
+
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `congress_${congressInput.value}_stats.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 loadBtn.addEventListener('click', () => loadData());
+exportBtn.addEventListener('click', exportCSV);
 searchBox.addEventListener('input', () => render());
 chamberFilter.addEventListener('change', () => render());
 

@@ -1,17 +1,21 @@
 import os
 import time
 import json
-import hashlib
-import urllib.parse
 from typing import Dict, Any, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from requests.exceptions import Timeout, RequestException, ConnectionError as ReqConnErr
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+
+# Import database module
+try:
+    from . import database as db
+except ImportError:
+    import database as db
 
 # =======================
 # Config
@@ -21,21 +25,20 @@ API_KEY   = os.environ.get("CONGRESS_API_KEY", "")
 CACHE_DIR = os.environ.get("CACHE_DIR", "./cache")
 DEFAULT_CONGRESS = int(os.environ.get("DEFAULT_CONGRESS", "119"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))  # parallel page fetchers
+DETAIL_WORKERS = int(os.environ.get("DETAIL_WORKERS", "8"))  # parallel item fetchers
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Cache directory for raw API responses
-HTTP_CACHE_DIR = os.path.join(CACHE_DIR, "http")
-os.makedirs(HTTP_CACHE_DIR, exist_ok=True)
+# Action codes that indicate a bill became law (public or private).
+# Source: Congress.gov action codes (public law ~36000–40000; private law ~41000–45000)
+# Note: These are kept as fallback but we now primarily use the /law endpoint
+ENACTED_CODES = {
+    36000, 37000, 38000, 39000, 40000,   # public law
+    41000, 42000, 43000, 44000, 45000    # private law
+}
 
-# Action codes that indicate a bill became law.
-# Source: Congress.gov action codes (public law 36000–39999; private law 41000–44999)
-PUBLIC_LAW_RANGE = (36000, 39999)
-PRIVATE_LAW_RANGE = (41000, 44999)
-ENACTED_CODE_RANGES = (
-    PUBLIC_LAW_RANGE,
-    PRIVATE_LAW_RANGE,
-)
+# Track background refresh status
+_refresh_status: Dict[int, Dict[str, Any]] = {}
 
 app = FastAPI(title="Congress Bill Stats", version="1.0.0")
 
@@ -62,76 +65,65 @@ def cache_path(congress: int) -> str:
     return os.path.join(CACHE_DIR, f"stats_{congress}.json")
 
 def load_cache(congress: int) -> Optional[Dict[str, Any]]:
+    """Load cached stats from file or database."""
+    # Try file cache first (faster)
     fp = cache_path(congress)
     if os.path.exists(fp):
         try:
             with open(fp, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            return None
+            pass
+
+    # Try database cache
+    try:
+        cached = db.load_stats_cache(congress)
+        if cached:
+            return cached
+    except Exception as e:
+        print(f"[cache] Database cache lookup failed: {e}", flush=True)
+
     return None
 
 def save_cache(congress: int, data: Dict[str, Any]) -> None:
+    """Save stats to both file and database cache."""
+    # Save to file
     tmp = cache_path(congress) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f)
     os.replace(tmp, cache_path(congress))
 
-def law_type_from_action_code(action_code: Optional[int]) -> Optional[str]:
-    """Return 'Public Law' or 'Private Law' based on the action code."""
-    if action_code is None:
-        return None
+    # Save to database (if not already saved by build_stats)
     try:
-        code = int(action_code)
-    except (TypeError, ValueError):
-        return None
-
-    if PUBLIC_LAW_RANGE[0] <= code <= PUBLIC_LAW_RANGE[1]:
-        return "Public Law"
-    if PRIVATE_LAW_RANGE[0] <= code <= PRIVATE_LAW_RANGE[1]:
-        return "Private Law"
-    return None
-
+        db.save_stats_cache(congress, data)
+    except Exception as e:
+        print(f"[cache] Database cache save failed: {e}", flush=True)
 
 def is_enacted(action_code: Optional[int]) -> bool:
-    """Return True if the action code indicates the bill became law."""
-    return law_type_from_action_code(action_code) is not None
+    """Check if action code indicates enacted status (fallback method)."""
+    if action_code is None:
+        return False
+    try:
+        return int(action_code) in ENACTED_CODES
+    except Exception:
+        return False
 
 
-def get_law_type(bill: Dict[str, Any]) -> Optional[str]:
-    """Determine law type from bill data (item or list level)."""
-    laws = bill.get("laws")
-    if isinstance(laws, dict):
-        t = laws.get("type")
-        if t:
-            return t
-    latest = bill.get("latestAction") or {}
-    return law_type_from_action_code(latest.get("actionCode"))
+def normalize_bill_key(congress: int, bill_type: str, bill_number: int) -> str:
+    """Create a consistent key for bill lookup: 'congress-type-number' (e.g., '119-hr-1234')."""
+    return f"{congress}-{bill_type.lower()}-{bill_number}"
 
 # -------------------------------
 # HTTP client for Congress.gov
 # -------------------------------
-def api_get(path: str, params: Optional[Dict[str, Any]] = None, use_cache: bool = True) -> Dict[str, Any]:
-    """GET helper for Congress.gov API with retries, timeouts, and simple file caching."""
+def api_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """GET helper for Congress.gov API with retries, timeouts, and safe logging."""
     if not API_KEY:
         raise HTTPException(status_code=500, detail="Missing CONGRESS_API_KEY env var.")
 
     url = f"{API_ROOT.rstrip('/')}/{path.lstrip('/')}"
     headers = {"X-Api-Key": API_KEY, "Accept": "application/json"}
     params = {**(params or {}), "format": "json"}  # ask for JSON; key is in header
-
-    cache_file = None
-    if use_cache:
-        key = f"{url}?{urllib.parse.urlencode(sorted(params.items()))}"
-        name = hashlib.sha256(key.encode("utf-8")).hexdigest()
-        cache_file = os.path.join(HTTP_CACHE_DIR, f"{name}.json")
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    print(f"[http-cache] hit {url}", flush=True)
-                    return json.load(f)
-            except Exception:
-                pass
 
     for attempt in range(3):
         try:
@@ -146,16 +138,9 @@ def api_get(path: str, params: Optional[Dict[str, Any]] = None, use_cache: bool 
 
             if resp.status_code == 200:
                 try:
-                    data = resp.json()
+                    return resp.json()
                 except ValueError:
                     raise HTTPException(status_code=502, detail="Invalid JSON from Congress API")
-
-                if cache_file:
-                    tmp = cache_file + ".tmp"
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump(data, f)
-                    os.replace(tmp, cache_file)
-                return data
 
             if resp.status_code >= 500 and attempt < 2:
                 time.sleep(1.2 * (attempt + 1))
@@ -198,12 +183,12 @@ def _extract_bills(j: Dict[str, Any]) -> List[Dict[str, Any]]:
         return [_normalize_bill_item(it) for it in data]
     return []
 
-def fetch_all_bills_for_congress(congress: int, use_cache: bool = True) -> List[Dict[str, Any]]:
+def fetch_all_bills_for_congress(congress: int) -> List[Dict[str, Any]]:
     """Fetch all bills for a Congress: probe first page, then fetch remaining pages in parallel."""
     limit = 250
 
     # First page
-    first = api_get(f"/bill/{congress}", params={"limit": limit, "offset": 0}, use_cache=use_cache)
+    first = api_get(f"/bill/{congress}", params={"limit": limit, "offset": 0})
     bills: List[Dict[str, Any]] = _extract_bills(first)
     pagination = first.get("pagination") or {}
     total = int(pagination.get("count") or 0)
@@ -221,9 +206,7 @@ def fetch_all_bills_for_congress(congress: int, use_cache: bool = True) -> List[
     max_workers = int(os.environ.get("MAX_WORKERS", "8"))
 
     def fetch_page(off: int) -> List[Dict[str, Any]]:
-        r = api_get(
-            f"/bill/{congress}", params={"limit": limit, "offset": off}, use_cache=use_cache
-        )
+        r = api_get(f"/bill/{congress}", params={"limit": limit, "offset": off})
         return _extract_bills(r)
 
     fetched = 0
@@ -300,18 +283,15 @@ def _bill_identity(congress: int, b: Dict[str, Any]) -> Optional[str]:
         return f"/bill/{congress}/{typ}/{num}"
     return None
 
-def fetch_primary_sponsor_from_item(
-    congress: int, b: Dict[str, Any], use_cache: bool = True
-) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+def fetch_primary_sponsor_from_item(congress: int, b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Fetch the *item* endpoint and extract the first sponsor, returning the full
-    bill object along with sponsor info.
+    Fetch the *item* endpoint and extract the first sponsor.
     Item shape (JSON): { "data": { "bill": { "sponsors": { "item": [ ... ] }, "originChamber": ... } } }
     """
     path = _bill_identity(congress, b)
     if not path:
-        return b, None
-    j = api_get(path, use_cache=use_cache)
+        return None
+    j = api_get(path)
     data = j.get("data") or {}
     bill = data.get("bill") or j.get("bill") or {}
     sponsors = bill.get("sponsors") or {}
@@ -320,23 +300,22 @@ def fetch_primary_sponsor_from_item(
         s0 = items[0] or {}
         bioguide = s0.get("bioguideId") or s0.get("bioguideID") or s0.get("bioguide")
         if bioguide:
-            sponsor = {
+            return {
                 "bioguideId": bioguide,
                 "fullName": s0.get("fullName") or s0.get("name"),
                 "party": s0.get("party"),
                 "state": s0.get("state"),
                 "chamber": s0.get("chamber") or bill.get("originChamber"),
             }
-            return bill, sponsor
-    return bill, None
+    return None
 
 
 # -------------------------------
 # Member lookup (unchanged, but resilient to shape)
 # -------------------------------
-def fetch_member_snapshot(bioguide_id: str, use_cache: bool = True) -> Dict[str, Any]:
+def fetch_member_snapshot(bioguide_id: str) -> Dict[str, Any]:
     """Get member details to attach chamber/state/party."""
-    resp = api_get(f"/member/{bioguide_id}", use_cache=use_cache)
+    resp = api_get(f"/member/{bioguide_id}")
     data = resp.get("data") or {}
     member = data.get("member") or resp.get("member") or {}
     out = {
@@ -358,62 +337,174 @@ def fetch_member_snapshot(bioguide_id: str, use_cache: bool = True) -> Dict[str,
 
 
 # -------------------------------
+# Law fetching (primary source for enacted bills)
+# -------------------------------
+def _extract_laws(j: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract law items from API response, handling various shapes."""
+    # Try common response shapes
+    if isinstance(j.get("laws"), list):
+        return j["laws"]
+    data = j.get("data")
+    if isinstance(data, dict) and isinstance(data.get("laws"), list):
+        return data["laws"]
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def fetch_all_laws_for_congress(congress: int) -> List[Dict[str, Any]]:
+    """
+    Fetch all enacted laws for a Congress using the /law endpoint.
+    Returns list of law objects with bill references.
+    """
+    limit = 250
+    all_laws: List[Dict[str, Any]] = []
+
+    # Fetch public laws
+    print(f"[laws] Fetching public laws for Congress {congress}...", flush=True)
+    try:
+        first_pub = api_get(f"/law/{congress}/pub", params={"limit": limit, "offset": 0})
+        pub_laws = _extract_laws(first_pub)
+        pagination = first_pub.get("pagination") or {}
+        total_pub = int(pagination.get("count") or len(pub_laws))
+        print(f"[laws] Public laws: {total_pub} total, first page: {len(pub_laws)}", flush=True)
+
+        for law in pub_laws:
+            law["_law_type"] = "public"
+        all_laws.extend(pub_laws)
+
+        # Fetch remaining pages if needed
+        if total_pub > limit:
+            offsets = list(range(limit, total_pub, limit))
+            for off in offsets:
+                resp = api_get(f"/law/{congress}/pub", params={"limit": limit, "offset": off})
+                page_laws = _extract_laws(resp)
+                for law in page_laws:
+                    law["_law_type"] = "public"
+                all_laws.extend(page_laws)
+                print(f"[laws] Public laws fetched: {len(all_laws)}/{total_pub}", flush=True)
+    except HTTPException as e:
+        print(f"[laws] Error fetching public laws: {e.detail}", flush=True)
+
+    # Fetch private laws
+    print(f"[laws] Fetching private laws for Congress {congress}...", flush=True)
+    try:
+        first_priv = api_get(f"/law/{congress}/priv", params={"limit": limit, "offset": 0})
+        priv_laws = _extract_laws(first_priv)
+        pagination = first_priv.get("pagination") or {}
+        total_priv = int(pagination.get("count") or len(priv_laws))
+        print(f"[laws] Private laws: {total_priv} total, first page: {len(priv_laws)}", flush=True)
+
+        for law in priv_laws:
+            law["_law_type"] = "private"
+        all_laws.extend(priv_laws)
+
+        # Fetch remaining pages if needed
+        if total_priv > limit:
+            offsets = list(range(limit, total_priv, limit))
+            for off in offsets:
+                resp = api_get(f"/law/{congress}/priv", params={"limit": limit, "offset": off})
+                page_laws = _extract_laws(resp)
+                for law in page_laws:
+                    law["_law_type"] = "private"
+                all_laws.extend(page_laws)
+                print(f"[laws] Private laws fetched: {len(all_laws) - total_pub}/{total_priv}", flush=True)
+    except HTTPException as e:
+        print(f"[laws] Error fetching private laws: {e.detail}", flush=True)
+
+    print(f"[laws] Total laws fetched: {len(all_laws)}", flush=True)
+    return all_laws
+
+
+def build_law_lookup(congress: int, laws: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Build a lookup dict from bill key to law info.
+    Key format: 'congress-type-number' (e.g., '119-hr-1234')
+    Value: {'law_type': 'public'|'private', 'law_number': '119-1'}
+    """
+    lookup: Dict[str, Dict[str, Any]] = {}
+
+    for law in laws:
+        # Extract bill reference from law
+        # Law response typically has: type, number, and bill reference
+        law_type = law.get("_law_type", "public")
+        law_number = law.get("number")
+
+        # The law endpoint returns bill info - try various shapes
+        bill = law.get("bill") or {}
+        if not bill:
+            # Sometimes the law IS the bill reference
+            bill = law
+
+        bill_type = (bill.get("type") or "").lower()
+        bill_number = bill.get("number")
+        bill_congress = bill.get("congress") or congress
+
+        if bill_type and bill_number:
+            key = normalize_bill_key(bill_congress, bill_type, bill_number)
+            lookup[key] = {
+                "law_type": law_type,
+                "law_number": law_number,
+            }
+
+    print(f"[laws] Built lookup with {len(lookup)} bill-to-law mappings", flush=True)
+    return lookup
+
+
+# -------------------------------
 # Aggregation (with item-level fallback)
 # -------------------------------
-def build_stats(congress: int, use_cache: bool = True) -> Dict[str, Any]:
-    """Aggregate counts by sponsor from bill list; fetch item details when needed."""
-    raw_bills = fetch_all_bills_for_congress(congress, use_cache=use_cache)
+def build_stats(congress: int) -> Dict[str, Any]:
+    """
+    Aggregate counts by sponsor from bill list; use /law endpoint for enacted status.
+    Returns sponsor statistics with public/private law breakdown.
+    """
+    # Step 1: Fetch all laws first (this is the authoritative source for enacted bills)
+    print(f"[build_stats] Starting stats build for Congress {congress}", flush=True)
+    laws = fetch_all_laws_for_congress(congress)
+    law_lookup = build_law_lookup(congress, laws)
 
-    # Try list-level sponsor/action code; fall back to item-level if either missing
+    # Step 2: Fetch all bills
+    raw_bills = fetch_all_bills_for_congress(congress)
+
+    # Step 3: Extract sponsors - try list-level first, fallback to item-level
     list_level: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
     need_items: List[Dict[str, Any]] = []
 
     for b in raw_bills:
         s = extract_primary_sponsor(b)
-        latest = b.get("latestAction") or {}
-        action_code = latest.get("actionCode")
-        if s and action_code is not None:
+        if s:
             list_level.append((b, s))
         else:
             need_items.append(b)
 
-    print(
-        f"[agg] bills={len(raw_bills)} list_level_sponsors={len(list_level)} need_items={len(need_items)}",
-        flush=True,
-    )
+    print(f"[agg] bills={len(raw_bills)} list_level_sponsors={len(list_level)} need_items={len(need_items)}", flush=True)
 
-    # Fetch item-level details in parallel when needed (tune workers to respect rate limits)
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    detail_workers = int(os.environ.get("DETAIL_WORKERS", "8"))
+    # Fetch item-level sponsors in parallel for bills missing sponsor data
     item_results: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
 
     if need_items:
-        with ThreadPoolExecutor(max_workers=detail_workers) as pool:
-            futs = {
-                pool.submit(fetch_primary_sponsor_from_item, congress, b, use_cache): b
-                for b in need_items
-            }
+        with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as pool:
+            futs = {pool.submit(fetch_primary_sponsor_from_item, congress, b): b for b in need_items}
             done = 0
             for fut in as_completed(futs):
-                orig = futs[fut]
+                b = futs[fut]
                 try:
-                    bill_detail, s = fut.result()
+                    s = fut.result()
                 except Exception:
-                    bill_detail, s = orig, None
-                item_results.append((bill_detail, s))
+                    s = None
+                item_results.append((b, s))
                 done += 1
                 if done % 50 == 0 or done == len(need_items):
-                    print(
-                        f"[items] fetched {done}/{len(need_items)} item details",
-                        flush=True,
-                    )
+                    print(f"[items] fetched {done}/{len(need_items)} item sponsors", flush=True)
 
-    # Combine
+    # Combine all bill-sponsor pairs
     pairs = list_level + item_results
 
-    # Tally
+    # Step 4: Tally by sponsor using the law lookup
     by_sponsor: Dict[str, Dict[str, Any]] = {}
     missing_sponsor = 0
+    laws_matched = 0
 
     for b, sponsor_info in pairs:
         if not sponsor_info:
@@ -421,7 +512,14 @@ def build_stats(congress: int, use_cache: bool = True) -> Dict[str, Any]:
             continue
 
         bioguide = sponsor_info["bioguideId"]
-        law_type = get_law_type(b)
+
+        # Build bill key for law lookup
+        bill_type = (b.get("type") or "").lower()
+        bill_number = b.get("number")
+        bill_key = normalize_bill_key(congress, bill_type, bill_number) if bill_type and bill_number else None
+
+        # Check if this bill became law using the law lookup
+        law_info = law_lookup.get(bill_key) if bill_key else None
 
         rec = by_sponsor.get(bioguide)
         if rec is None:
@@ -433,25 +531,32 @@ def build_stats(congress: int, use_cache: bool = True) -> Dict[str, Any]:
                 "chamber": sponsor_info.get("chamber"),
                 "sponsored_total": 0,
                 "enacted_total": 0,
-                "public_law_total": 0,
-                "private_law_total": 0,
+                "public_law_count": 0,
+                "private_law_count": 0,
             }
             by_sponsor[bioguide] = rec
 
         rec["sponsored_total"] += 1
-        if law_type:
-            rec["enacted_total"] += 1
-            if law_type == "Public Law":
-                rec["public_law_total"] += 1
-            elif law_type == "Private Law":
-                rec["private_law_total"] += 1
 
-    # Enrich any missing meta from the member endpoint (<= 535 lookups worst case)
-    for bioguide, rec in by_sponsor.items():
-        needs = any(rec.get(k) in (None, "", "Unknown") for k in ("party", "state", "chamber", "sponsorName"))
-        if needs:
+        if law_info:
+            laws_matched += 1
+            rec["enacted_total"] += 1
+            if law_info["law_type"] == "public":
+                rec["public_law_count"] += 1
+            else:
+                rec["private_law_count"] += 1
+
+    # Step 5: Enrich any missing metadata from the member endpoint
+    needs_enrichment = [
+        (bioguide, rec) for bioguide, rec in by_sponsor.items()
+        if any(rec.get(k) in (None, "", "Unknown") for k in ("party", "state", "chamber", "sponsorName"))
+    ]
+
+    if needs_enrichment:
+        print(f"[agg] Enriching {len(needs_enrichment)} sponsors with missing metadata...", flush=True)
+        for bioguide, rec in needs_enrichment:
             try:
-                m = fetch_member_snapshot(bioguide, use_cache=use_cache)
+                m = fetch_member_snapshot(bioguide)
                 rec["party"] = rec["party"] or m.get("party")
                 rec["state"] = rec["state"] or m.get("state")
                 rec["chamber"] = rec["chamber"] or m.get("chamber")
@@ -462,41 +567,151 @@ def build_stats(congress: int, use_cache: bool = True) -> Dict[str, Any]:
     rows = list(by_sponsor.values())
     rows.sort(key=lambda r: (-int(r["sponsored_total"]), r.get("sponsorName") or ""))
 
+    # Calculate summary stats
+    total_public = sum(r["public_law_count"] for r in rows)
+    total_private = sum(r["private_law_count"] for r in rows)
+
     print(
-        f"[agg] final sponsors={len(rows)} missing_after_item={missing_sponsor}",
+        f"[agg] final sponsors={len(rows)} missing_sponsor={missing_sponsor} "
+        f"laws_matched={laws_matched} (public={total_public}, private={total_private})",
         flush=True
     )
 
-    return {
+    stats = {
         "congress": congress,
         "generated_at": int(time.time()),
         "rows": rows,
+        "summary": {
+            "total_legislators": len(rows),
+            "total_bills": len(raw_bills),
+            "total_laws": len(laws),
+            "public_laws": total_public,
+            "private_laws": total_private,
+        },
         "note": (
-            "“Became Law” counts bills where the bill's laws.type is 'Public Law' or 'Private Law' "
-            "or latestAction.actionCode falls in those ranges. Public and private law totals are provided separately. "
-            "Sponsors are taken from list level when present, otherwise from the bill item’s sponsors.item[0]."
+            "Law counts are determined using the Congress.gov /law endpoint, which provides "
+            "authoritative data on enacted legislation. 'Public Laws' and 'Private Laws' show "
+            "the breakdown by law type."
         ),
     }
 
+    # Save to database for persistence
+    try:
+        # Save legislators
+        db.save_legislators_batch(rows)
+
+        # Prepare bills with sponsor info for database
+        bills_with_sponsors = []
+        for b, sponsor_info in pairs:
+            if sponsor_info:
+                b["_sponsor_info"] = sponsor_info
+                bills_with_sponsors.append(b)
+        db.save_bills_batch(congress, bills_with_sponsors)
+
+        # Save laws with sponsor info
+        for law in laws:
+            bill = law.get("bill") or law
+            bill_type = (bill.get("type") or "").lower()
+            bill_number = bill.get("number")
+            if bill_type and bill_number:
+                bill_key = normalize_bill_key(congress, bill_type, bill_number)
+                # Find sponsor from our pairs
+                for b, sponsor_info in pairs:
+                    b_type = (b.get("type") or "").lower()
+                    b_num = b.get("number")
+                    if b_type == bill_type and b_num == bill_number and sponsor_info:
+                        law["_sponsor_bioguide_id"] = sponsor_info["bioguideId"]
+                        break
+        db.save_laws_batch(congress, laws)
+
+        # Save stats cache
+        db.save_stats_cache(congress, stats)
+        print(f"[db] Persisted all data for Congress {congress}", flush=True)
+    except Exception as e:
+        print(f"[db] Warning: Failed to persist to database: {e}", flush=True)
+
+    return stats
+
+
+
+# -------------------------------
+# Background refresh logic
+# -------------------------------
+def _do_background_refresh(congress: int):
+    """Run stats refresh in background, updating status."""
+    global _refresh_status
+    _refresh_status[congress] = {"status": "running", "started_at": int(time.time())}
+    try:
+        stats = build_stats(congress)
+        save_cache(congress, stats)
+        _refresh_status[congress] = {
+            "status": "completed",
+            "completed_at": int(time.time()),
+            "summary": stats.get("summary", {}),
+        }
+    except Exception as e:
+        _refresh_status[congress] = {
+            "status": "error",
+            "error": str(e),
+            "completed_at": int(time.time()),
+        }
 
 
 # -------------------------------
 # Routes
 # -------------------------------
+@app.get("/health")
+def health_check():
+    """Health check endpoint for keeping the service warm."""
+    return {"status": "ok", "timestamp": int(time.time())}
+
+
 @app.get("/api/stats")
 def api_stats(
     congress: int = Query(DEFAULT_CONGRESS, ge=81, le=999),
     refresh: bool = Query(False, description="Force rebuild and refresh cache."),
+    background: bool = Query(False, description="Run refresh in background, return cached data immediately."),
+    background_tasks: BackgroundTasks = None,
 ):
-    print(f"[api_stats] start congress={congress} refresh={refresh}", flush=True)
+    """
+    Get legislator statistics for a Congress.
 
-    cached = None if refresh else load_cache(congress)
-    if cached:
+    - If cached data exists and refresh=False, returns cached data immediately.
+    - If refresh=True and background=True, returns cached data and refreshes in background.
+    - If refresh=True and background=False, rebuilds stats synchronously.
+    """
+    print(f"[api_stats] start congress={congress} refresh={refresh} background={background}", flush=True)
+
+    cached = load_cache(congress)
+
+    # If background refresh requested and we have cached data
+    if refresh and background and cached and background_tasks:
+        # Check if already refreshing
+        status = _refresh_status.get(congress, {})
+        if status.get("status") != "running":
+            background_tasks.add_task(_do_background_refresh, congress)
+            print(f"[api_stats] Started background refresh for Congress {congress}", flush=True)
+
+        # Return cached data with refresh status
+        cached["_refresh_status"] = "pending"
         return JSONResponse(cached)
 
-    stats = build_stats(congress, use_cache=not refresh)
+    # Return cached if not forcing refresh
+    if not refresh and cached:
+        return JSONResponse(cached)
+
+    # Synchronous refresh
+    stats = build_stats(congress)
     save_cache(congress, stats)
     return JSONResponse(stats)
+
+
+@app.get("/api/refresh-status")
+def refresh_status(congress: int = Query(DEFAULT_CONGRESS, ge=81, le=999)):
+    """Check the status of a background refresh."""
+    status = _refresh_status.get(congress, {"status": "none"})
+    return JSONResponse(status)
+
 
 @app.get("/", response_class=HTMLResponse)
 def index():
