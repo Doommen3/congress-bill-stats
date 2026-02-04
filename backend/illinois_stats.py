@@ -417,22 +417,8 @@ def _parse_actions(root: ET.Element) -> List[Dict[str, Any]]:
     """Parse actions from structured or flat ILGA XML formats."""
     actions: List[Dict[str, Any]] = []
 
-    # Structured action elements (<Actions><Action>...)
-    for action_path in ['.//Actions/Action', './/Action', './/actions/action']:
-        for action in root.findall(action_path):
-            action_text = _get_text(action, 'Description') or _get_text(action, 'Action') or (action.text or "")
-            action_date = _get_text(action, 'Date') or _get_text(action, 'ActionDate') or ""
-            action_chamber = _get_text(action, 'Chamber') or _get_text(action, 'chamber') or ""
-            if action_text and action_text.strip():
-                actions.append({
-                    "text": action_text.strip(),
-                    "date": action_date.strip(),
-                    "chamber": action_chamber.strip(),
-                })
-        if actions:
-            return actions
-
-    # Flat action list (<actions><statusdate>...</statusdate><action>...</action>...)
+    # Try flat action list first (<actions><statusdate>...</statusdate><action>...</action>...)
+    # This is the format used by ILGA FTP XML files
     actions_elem = root.find('.//actions') or root.find('.//Actions')
     if actions_elem is not None:
         current: Dict[str, Any] = {}
@@ -449,6 +435,26 @@ def _parse_actions(root: ET.Element) -> List[Dict[str, Any]]:
                 current["text"] = text
                 actions.append(current)
                 current = {}
+        # If we found actions with dates, return them
+        if actions and any(a.get("date") for a in actions):
+            return actions
+        # Otherwise reset and try structured format
+        actions = []
+
+    # Structured action elements (<Actions><Action>...)
+    for action_path in ['.//Actions/Action', './/Action', './/actions/action']:
+        for action in root.findall(action_path):
+            action_text = _get_text(action, 'Description') or _get_text(action, 'Action') or (action.text or "")
+            action_date = _get_text(action, 'Date') or _get_text(action, 'ActionDate') or ""
+            action_chamber = _get_text(action, 'Chamber') or _get_text(action, 'chamber') or ""
+            if action_text and action_text.strip():
+                actions.append({
+                    "text": action_text.strip(),
+                    "date": action_date.strip(),
+                    "chamber": action_chamber.strip(),
+                })
+        if actions:
+            return actions
 
     return actions
 

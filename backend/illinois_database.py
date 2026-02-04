@@ -591,6 +591,26 @@ def get_il_timeline_data(ga_session: int) -> Dict[str, Any]:
         }
 
 
+def _normalize_name_for_network(name: str) -> str:
+    """Normalize name for network matching - lowercase, strip titles/suffixes."""
+    if not name:
+        return ""
+    import re
+    # Remove titles
+    name = re.sub(r'^(Rep\.|Sen\.|Representative|Senator)\s+', '', name.strip(), flags=re.IGNORECASE)
+    # Remove suffixes
+    name = re.sub(r',?\s+(Jr\.?|Sr\.?|II|III|IV|V)$', '', name, flags=re.IGNORECASE)
+    return ' '.join(name.split()).lower()
+
+
+def _get_name_parts(name: str) -> tuple:
+    """Get first and last name from normalized name."""
+    parts = name.split()
+    if len(parts) >= 2:
+        return (parts[0], parts[-1])
+    return (name, name)
+
+
 def get_il_network_data(ga_session: int, min_connections: int = 3) -> Dict[str, Any]:
     """
     Get co-sponsor network data for D3.js visualization.
@@ -599,41 +619,74 @@ def get_il_network_data(ga_session: int, min_connections: int = 3) -> Dict[str, 
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        # Get all bills with sponsors and co-sponsors
+        # Get all legislators for lookup FIRST
         cursor.execute("""
-            SELECT
-                b.bill_id,
-                b.sponsor_member_id,
-                b.chief_co_sponsors,
-                b.co_sponsors,
-                l.name as sponsor_name,
-                l.party as sponsor_party
-            FROM il_bills b
-            LEFT JOIN il_legislators l ON b.sponsor_member_id = l.member_id
-            WHERE b.ga_session = ? AND b.sponsor_member_id IS NOT NULL
-        """, (ga_session,))
-
-        # Build connection counts between legislators
-        connections: Dict[tuple, int] = {}  # (member1, member2) -> count
-        legislator_info: Dict[str, Dict[str, Any]] = {}
-
-        # Get all legislators for lookup
-        cursor.execute("""
-            SELECT member_id, name, party, chamber, district
+            SELECT member_id, name, first_name, last_name, party, chamber, district
             FROM il_legislators WHERE ga_session = ?
         """, (ga_session,))
 
+        legislator_info: Dict[str, Dict[str, Any]] = {}
+        # Build multiple lookup indexes for fuzzy matching
+        lookup_exact: Dict[str, str] = {}  # normalized name -> member_id
+        lookup_last: Dict[str, list] = {}  # last name -> [member_ids]
+        lookup_first_last: Dict[str, str] = {}  # "first last" -> member_id
+
         for row in cursor.fetchall():
-            legislator_info[row["member_id"]] = {
-                "id": row["member_id"],
+            member_id = row["member_id"]
+            legislator_info[member_id] = {
+                "id": member_id,
                 "name": row["name"],
                 "party": row["party"],
                 "chamber": row["chamber"],
                 "district": row["district"],
             }
+            # Build lookup indexes
+            normalized = _normalize_name_for_network(row["name"])
+            lookup_exact[normalized] = member_id
+
+            first_name = (row["first_name"] or "").lower().strip()
+            last_name = (row["last_name"] or "").lower().strip()
+            if first_name and last_name:
+                lookup_first_last[f"{first_name} {last_name}"] = member_id
+            if last_name:
+                if last_name not in lookup_last:
+                    lookup_last[last_name] = []
+                lookup_last[last_name].append(member_id)
+
+        # Now get all bills with sponsors and co-sponsors
+        cursor.execute("""
+            SELECT
+                b.bill_id,
+                b.sponsor_member_id,
+                b.chief_co_sponsors,
+                b.co_sponsors
+            FROM il_bills b
+            WHERE b.ga_session = ? AND b.sponsor_member_id IS NOT NULL
+        """, (ga_session,))
+
+        bills = cursor.fetchall()  # Fetch all before processing
+
+        # Build connection counts between legislators
+        connections: Dict[tuple, int] = {}  # (member1, member2) -> count
+
+        def match_cosponsor(name: str) -> Optional[str]:
+            """Match co-sponsor name to member_id using fuzzy matching."""
+            normalized = _normalize_name_for_network(name)
+            # Try exact match
+            if normalized in lookup_exact:
+                return lookup_exact[normalized]
+            # Try first+last match
+            first, last = _get_name_parts(normalized)
+            key = f"{first} {last}"
+            if key in lookup_first_last:
+                return lookup_first_last[key]
+            # Try last name only (if unique)
+            if last in lookup_last and len(lookup_last[last]) == 1:
+                return lookup_last[last][0]
+            return None
 
         # Process bills for co-sponsorship links
-        for row in cursor.fetchall():
+        for row in bills:
             sponsor_id = row["sponsor_member_id"]
             if not sponsor_id:
                 continue
@@ -654,13 +707,7 @@ def get_il_network_data(ga_session: int, min_connections: int = 3) -> Dict[str, 
 
             # For each co-sponsor, create a link to the primary sponsor
             for cosponsor_name in all_cosponsors:
-                # Find cosponsor by name match (simplified - uses exact match on normalized name)
-                cosponsor_id = None
-                normalized = cosponsor_name.lower().strip()
-                for lid, linfo in legislator_info.items():
-                    if linfo["name"].lower().strip() == normalized:
-                        cosponsor_id = lid
-                        break
+                cosponsor_id = match_cosponsor(cosponsor_name)
 
                 if not cosponsor_id or cosponsor_id == sponsor_id:
                     continue
