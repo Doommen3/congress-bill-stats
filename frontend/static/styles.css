@@ -224,6 +224,23 @@ tbody tr:hover { background: #f8fafc; }
   color: #6b7280;
 }
 
+.network-zoom-controls {
+  display: flex;
+  gap: 0.25rem;
+  margin-left: auto;
+}
+
+.btn-sm {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.85rem;
+  min-width: 32px;
+}
+
+.network-hint {
+  margin-top: 0.5rem;
+  text-align: center;
+}
+
 .network-container {
   height: 500px;
   border: 1px solid #eef2f7;

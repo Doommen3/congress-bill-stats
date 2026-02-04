@@ -710,6 +710,56 @@ async function renderTimeline() {
 // Co-sponsor Network Graph
 // ==========================================
 let networkSimulation = null;
+let networkZoom = null;
+let networkSvg = null;
+let networkG = null;
+let networkNodes = null;
+
+// Scale force parameters based on node count
+function getNetworkForceParams(nodeCount) {
+  if (nodeCount < 20) return { charge: -300, distance: 100, collision: 25 };
+  if (nodeCount < 50) return { charge: -200, distance: 80, collision: 20 };
+  if (nodeCount < 100) return { charge: -100, distance: 60, collision: 15 };
+  return { charge: -50, distance: 40, collision: 10 };
+}
+
+// Fit the graph to view
+function fitNetworkToView() {
+  if (!networkSvg || !networkG || !networkNodes || !networkNodes.length) return;
+
+  const container = document.getElementById('networkContainer');
+  const width = container.clientWidth || 800;
+  const height = 500;
+  const padding = 50;
+
+  // Calculate bounding box of all nodes
+  const xExtent = d3.extent(networkNodes, d => d.x);
+  const yExtent = d3.extent(networkNodes, d => d.y);
+
+  if (!xExtent[0] || !yExtent[0]) return;
+
+  const graphWidth = xExtent[1] - xExtent[0] || 1;
+  const graphHeight = yExtent[1] - yExtent[0] || 1;
+
+  // Calculate scale to fit
+  const scale = Math.min(
+    (width - 2 * padding) / graphWidth,
+    (height - 2 * padding) / graphHeight,
+    2 // Max zoom level
+  );
+
+  // Calculate center offset
+  const centerX = (xExtent[0] + xExtent[1]) / 2;
+  const centerY = (yExtent[0] + yExtent[1]) / 2;
+
+  const translateX = width / 2 - centerX * scale;
+  const translateY = height / 2 - centerY * scale;
+
+  // Apply transform with animation
+  networkSvg.transition()
+    .duration(500)
+    .call(networkZoom.transform, d3.zoomIdentity.translate(translateX, translateY).scale(scale));
+}
 
 async function renderNetwork() {
   const section = document.getElementById('networkSection');
@@ -733,18 +783,36 @@ async function renderNetwork() {
 
     if (!data.nodes.length) {
       container.innerHTML = '<p class="muted">No co-sponsor connections found with minimum ' + minConnections + ' shared bills.</p>';
+      networkNodes = null;
       return;
     }
+
+    // Store nodes reference for fit-to-view
+    networkNodes = data.nodes;
 
     // Set up SVG dimensions
     const width = container.clientWidth || 800;
     const height = 500;
 
-    const svg = d3.select(container)
+    // Create SVG with zoom support
+    networkSvg = d3.select(container)
       .append('svg')
       .attr('width', width)
       .attr('height', height)
-      .attr('viewBox', [0, 0, width, height]);
+      .attr('viewBox', [0, 0, width, height])
+      .style('cursor', 'grab');
+
+    // Create a group for all zoomable content
+    networkG = networkSvg.append('g').attr('class', 'zoom-group');
+
+    // Set up zoom behavior
+    networkZoom = d3.zoom()
+      .scaleExtent([0.1, 4])
+      .on('zoom', (event) => {
+        networkG.attr('transform', event.transform);
+      });
+
+    networkSvg.call(networkZoom);
 
     // Color scale by party
     const partyColor = (party) => {
@@ -754,19 +822,24 @@ async function renderNetwork() {
       return '#6b7280';
     };
 
+    // Get force parameters based on node count
+    const forceParams = getNetworkForceParams(data.nodes.length);
+
     // Create simulation
     if (networkSimulation) {
       networkSimulation.stop();
     }
 
     networkSimulation = d3.forceSimulation(data.nodes)
-      .force('link', d3.forceLink(data.links).id(d => d.id).distance(80))
-      .force('charge', d3.forceManyBody().strength(-200))
+      .force('link', d3.forceLink(data.links).id(d => d.id).distance(forceParams.distance))
+      .force('charge', d3.forceManyBody().strength(forceParams.charge))
       .force('center', d3.forceCenter(width / 2, height / 2))
-      .force('collision', d3.forceCollide().radius(20));
+      .force('collision', d3.forceCollide().radius(forceParams.collision))
+      .force('x', d3.forceX(width / 2).strength(0.05))
+      .force('y', d3.forceY(height / 2).strength(0.05));
 
     // Draw links
-    const link = svg.append('g')
+    const link = networkG.append('g')
       .attr('class', 'links')
       .selectAll('line')
       .data(data.links)
@@ -776,15 +849,16 @@ async function renderNetwork() {
       .attr('stroke-width', d => Math.sqrt(d.value));
 
     // Draw nodes
-    const node = svg.append('g')
+    const node = networkG.append('g')
       .attr('class', 'nodes')
       .selectAll('circle')
       .data(data.nodes)
       .join('circle')
-      .attr('r', 8)
+      .attr('r', Math.max(5, 10 - data.nodes.length / 30))
       .attr('fill', d => partyColor(d.party))
       .attr('stroke', '#fff')
       .attr('stroke-width', 1.5)
+      .style('cursor', 'pointer')
       .call(d3.drag()
         .on('start', dragstarted)
         .on('drag', dragged)
@@ -794,22 +868,31 @@ async function renderNetwork() {
     node.append('title')
       .text(d => `${d.name} (${d.party || '?'}-${d.district || '?'})`);
 
-    // Add labels if enabled
+    // Add labels if enabled (only for smaller graphs or when explicitly requested)
     let labels = null;
-    if (showLabels) {
-      labels = svg.append('g')
+    if (showLabels && data.nodes.length < 80) {
+      labels = networkG.append('g')
         .attr('class', 'labels')
         .selectAll('text')
         .data(data.nodes)
         .join('text')
         .text(d => d.name.split(' ').pop())  // Last name only
-        .attr('font-size', '10px')
+        .attr('font-size', data.nodes.length < 30 ? '10px' : '8px')
         .attr('dx', 12)
-        .attr('dy', 4);
+        .attr('dy', 4)
+        .attr('fill', '#374151')
+        .style('pointer-events', 'none');
     }
 
-    // Update positions on tick
+    // Update positions on tick with boundary awareness
+    const padding = 50;
     networkSimulation.on('tick', () => {
+      // Soft boundary constraint (pull towards center if too far)
+      data.nodes.forEach(d => {
+        d.x = Math.max(padding, Math.min(width - padding, d.x));
+        d.y = Math.max(padding, Math.min(height - padding, d.y));
+      });
+
       link
         .attr('x1', d => d.source.x)
         .attr('y1', d => d.source.y)
@@ -825,6 +908,11 @@ async function renderNetwork() {
           .attr('x', d => d.x)
           .attr('y', d => d.y);
       }
+    });
+
+    // Auto fit-to-view after simulation stabilizes
+    networkSimulation.on('end', () => {
+      setTimeout(fitNetworkToView, 100);
     });
 
     function dragstarted(event, d) {
@@ -849,12 +937,28 @@ async function renderNetwork() {
   }
 }
 
+// Zoom control functions
+function networkZoomIn() {
+  if (networkSvg && networkZoom) {
+    networkSvg.transition().duration(300).call(networkZoom.scaleBy, 1.5);
+  }
+}
+
+function networkZoomOut() {
+  if (networkSvg && networkZoom) {
+    networkSvg.transition().duration(300).call(networkZoom.scaleBy, 0.67);
+  }
+}
+
 // ==========================================
 // Event Handlers - Timeline & Network
 // ==========================================
 document.getElementById('networkRefresh').addEventListener('click', renderNetwork);
 document.getElementById('networkShowLabels').addEventListener('change', renderNetwork);
 document.getElementById('networkMinConnections').addEventListener('change', renderNetwork);
+document.getElementById('networkZoomIn').addEventListener('click', networkZoomIn);
+document.getElementById('networkZoomOut').addEventListener('click', networkZoomOut);
+document.getElementById('networkFitView').addEventListener('click', fitNetworkToView);
 
 // ==========================================
 // Initialize

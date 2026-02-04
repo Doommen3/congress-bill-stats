@@ -130,8 +130,14 @@
         <label><input type="checkbox" id="networkShowLabels" checked> Show names</label>
         <label>Min connections: <input type="number" id="networkMinConnections" value="3" min="1" max="20" style="width: 60px;"></label>
         <button id="networkRefresh" class="btn secondary">Refresh</button>
+        <span class="network-zoom-controls">
+          <button id="networkZoomIn" class="btn secondary btn-sm" title="Zoom In">+</button>
+          <button id="networkZoomOut" class="btn secondary btn-sm" title="Zoom Out">−</button>
+          <button id="networkFitView" class="btn secondary btn-sm" title="Fit to View">Fit</button>
+        </span>
       </div>
       <div id="networkContainer" class="network-container"></div>
+      <p class="network-hint muted tiny">Drag to pan, scroll to zoom. Click "Fit" to see all nodes.</p>
     </section>
 
     <div class="card">

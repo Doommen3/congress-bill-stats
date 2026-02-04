@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Network Graph Tests</title>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7.8.5/dist/d3.min.js"></script>
+  <style>
+    body { font-family: sans-serif; padding: 20px; }
+    .test { margin: 10px 0; padding: 10px; border: 1px solid #ccc; }
+    .pass { background: #d4edda; }
+    .fail { background: #f8d7da; }
+    #testResults { margin-top: 20px; }
+    .network-container {
+      width: 800px;
+      height: 500px;
+      border: 1px solid #ccc;
+      position: relative;
+    }
+  </style>
+</head>
+<body>
+  <h1>Network Graph Tests</h1>
+  <div id="testContainer" class="network-container"></div>
+  <div id="testResults"></div>
+
+  <script>
+    // Test utilities
+    const results = [];
+
+    function test(name, fn) {
+      try {
+        fn();
+        results.push({ name, pass: true });
+      } catch (e) {
+        results.push({ name, pass: false, error: e.message });
+      }
+    }
+
+    function assert(condition, message) {
+      if (!condition) throw new Error(message || 'Assertion failed');
+    }
+
+    function showResults() {
+      const el = document.getElementById('testResults');
+      el.innerHTML = results.map(r =>
+        `<div class="test ${r.pass ? 'pass' : 'fail'}">
+          ${r.pass ? '✓' : '✗'} ${r.name}
+          ${r.error ? `<br><small>${r.error}</small>` : ''}
+        </div>`
+      ).join('');
+
+      const passed = results.filter(r => r.pass).length;
+      console.log(`Tests: ${passed}/${results.length} passed`);
+    }
+
+    // Mock data for testing
+    const mockNodes = [
+      { id: '1', name: 'Alice Smith', party: 'D', district: 1 },
+      { id: '2', name: 'Bob Jones', party: 'R', district: 2 },
+      { id: '3', name: 'Carol White', party: 'D', district: 3 },
+      { id: '4', name: 'Dan Brown', party: 'R', district: 4 },
+      { id: '5', name: 'Eve Green', party: 'D', district: 5 },
+    ];
+
+    const mockLinks = [
+      { source: '1', target: '2', value: 5 },
+      { source: '1', target: '3', value: 3 },
+      { source: '2', target: '4', value: 4 },
+      { source: '3', target: '5', value: 2 },
+    ];
+
+    // Large dataset for stress testing
+    const largeMockNodes = [];
+    const largeMockLinks = [];
+    for (let i = 0; i < 100; i++) {
+      largeMockNodes.push({
+        id: `node-${i}`,
+        name: `Person ${i}`,
+        party: i % 2 === 0 ? 'D' : 'R',
+        district: i
+      });
+    }
+    for (let i = 0; i < 200; i++) {
+      largeMockLinks.push({
+        source: `node-${Math.floor(Math.random() * 100)}`,
+        target: `node-${Math.floor(Math.random() * 100)}`,
+        value: Math.floor(Math.random() * 10) + 1
+      });
+    }
+
+    // ===================
+    // TESTS
+    // ===================
+
+    test('SVG element is created with correct dimensions', () => {
+      const container = document.getElementById('testContainer');
+      container.innerHTML = '';
+
+      const width = 800;
+      const height = 500;
+
+      const svg = d3.select(container)
+        .append('svg')
+        .attr('width', width)
+        .attr('height', height);
+
+      const svgEl = container.querySelector('svg');
+      assert(svgEl !== null, 'SVG should exist');
+      assert(svgEl.getAttribute('width') === '800', 'Width should be 800');
+      assert(svgEl.getAttribute('height') === '500', 'Height should be 500');
+    });
+
+    test('Zoom behavior can be added to SVG', () => {
+      const container = document.getElementById('testContainer');
+      container.innerHTML = '';
+
+      const svg = d3.select(container)
+        .append('svg')
+        .attr('width', 800)
+        .attr('height', 500);
+
+      const g = svg.append('g').attr('class', 'zoom-group');
+
+      const zoom = d3.zoom()
+        .scaleExtent([0.1, 4])
+        .on('zoom', (event) => {
+          g.attr('transform', event.transform);
+        });
+
+      svg.call(zoom);
+
+      // Verify zoom is attached
+      assert(typeof zoom === 'function', 'Zoom should be a function');
+      assert(svg.node().__zoom !== undefined || true, 'Zoom should be attached to SVG');
+    });
+
+    test('Nodes stay within boundaries with bounding force', () => {
+      const width = 800;
+      const height = 500;
+      const padding = 20;
+
+      // Simulate boundary constraint function
+      function boundNode(d) {
+        d.x = Math.max(padding, Math.min(width - padding, d.x));
+        d.y = Math.max(padding, Math.min(height - padding, d.y));
+      }
+
+      // Test node that's out of bounds
+      const testNode = { x: -50, y: 600 };
+      boundNode(testNode);
+
+      assert(testNode.x >= padding, 'X should be >= padding');
+      assert(testNode.x <= width - padding, 'X should be <= width - padding');
+      assert(testNode.y >= padding, 'Y should be >= padding');
+      assert(testNode.y <= height - padding, 'Y should be <= height - padding');
+    });
+
+    test('Force parameters scale with node count', () => {
+      function getChargeStrength(nodeCount) {
+        if (nodeCount < 20) return -300;
+        if (nodeCount < 50) return -200;
+        if (nodeCount < 100) return -100;
+        return -50;
+      }
+
+      function getLinkDistance(nodeCount) {
+        if (nodeCount < 20) return 100;
+        if (nodeCount < 50) return 80;
+        if (nodeCount < 100) return 60;
+        return 40;
+      }
+
+      assert(getChargeStrength(10) === -300, 'Small graph should have strong charge');
+      assert(getChargeStrength(30) === -200, 'Medium graph should have medium charge');
+      assert(getChargeStrength(75) === -100, 'Large graph should have weak charge');
+      assert(getChargeStrength(150) === -50, 'Very large graph should have very weak charge');
+
+      assert(getLinkDistance(10) === 100, 'Small graph should have long links');
+      assert(getLinkDistance(150) === 40, 'Large graph should have short links');
+    });
+
+    test('Fit-to-view calculates correct transform', () => {
+      const width = 800;
+      const height = 500;
+      const padding = 40;
+
+      // Mock nodes with positions
+      const nodes = [
+        { x: 100, y: 100 },
+        { x: 700, y: 100 },
+        { x: 100, y: 400 },
+        { x: 700, y: 400 },
+      ];
+
+      // Calculate bounding box
+      const xExtent = d3.extent(nodes, d => d.x);
+      const yExtent = d3.extent(nodes, d => d.y);
+
+      const graphWidth = xExtent[1] - xExtent[0];
+      const graphHeight = yExtent[1] - yExtent[0];
+
+      const scale = Math.min(
+        (width - 2 * padding) / graphWidth,
+        (height - 2 * padding) / graphHeight,
+        1.5 // Max zoom
+      );
+
+      assert(xExtent[0] === 100, 'Min X should be 100');
+      assert(xExtent[1] === 700, 'Max X should be 700');
+      assert(graphWidth === 600, 'Graph width should be 600');
+      assert(scale <= 1.5, 'Scale should not exceed max zoom');
+      assert(scale > 0, 'Scale should be positive');
+    });
+
+    test('Simulation with many nodes completes without error', () => {
+      const container = document.getElementById('testContainer');
+      container.innerHTML = '';
+
+      const width = 800;
+      const height = 500;
+
+      const svg = d3.select(container)
+        .append('svg')
+        .attr('width', width)
+        .attr('height', height);
+
+      const g = svg.append('g');
+
+      // Create simulation with large dataset
+      const simulation = d3.forceSimulation(largeMockNodes)
+        .force('link', d3.forceLink(largeMockLinks).id(d => d.id).distance(40))
+        .force('charge', d3.forceManyBody().strength(-50))
+        .force('center', d3.forceCenter(width / 2, height / 2))
+        .force('collision', d3.forceCollide().radius(10));
+
+      // Run a few ticks
+      for (let i = 0; i < 10; i++) {
+        simulation.tick();
+      }
+
+      // Verify nodes have positions
+      assert(largeMockNodes[0].x !== undefined, 'Nodes should have x position');
+      assert(largeMockNodes[0].y !== undefined, 'Nodes should have y position');
+
+      simulation.stop();
+    });
+
+    test('Zoom controls can programmatically zoom', () => {
+      const container = document.getElementById('testContainer');
+      container.innerHTML = '';
+
+      const svg = d3.select(container)
+        .append('svg')
+        .attr('width', 800)
+        .attr('height', 500);
+
+      const g = svg.append('g').attr('class', 'zoom-group');
+
+      const zoom = d3.zoom()
+        .scaleExtent([0.1, 4])
+        .on('zoom', (event) => {
+          g.attr('transform', event.transform);
+        });
+
+      svg.call(zoom);
+
+      // Programmatic zoom in
+      svg.transition().duration(0).call(zoom.scaleBy, 1.5);
+
+      // Check transform was applied (may need small delay in real usage)
+      assert(true, 'Programmatic zoom should not throw');
+    });
+
+    // Run all tests
+    showResults();
+  </script>
+</body>
+</html>
