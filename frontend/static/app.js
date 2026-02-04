@@ -843,6 +843,40 @@ function getNetworkForceParams(nodeCount) {
   return { charge: -50, distance: 40, collision: 10 };
 }
 
+function computeNetworkForcePositions(nodes, links, width, height) {
+  if (!Array.isArray(nodes) || !nodes.length) return [];
+
+  const forceParams = getNetworkForceParams(nodes.length);
+  const simulationNodes = nodes.map(node => ({ ...node }));
+  const simulationLinks = (links || []).map(link => ({
+    source: parseNetworkLinkEndpointId(link.source),
+    target: parseNetworkLinkEndpointId(link.target),
+    value: Number(link.value) || 1,
+  }));
+
+  const simulation = d3.forceSimulation(simulationNodes)
+    .force('link', d3.forceLink(simulationLinks).id(d => d.id).distance(forceParams.distance))
+    .force('charge', d3.forceManyBody().strength(forceParams.charge))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide().radius(forceParams.collision))
+    .force('x', d3.forceX(width / 2).strength(0.05))
+    .force('y', d3.forceY(height / 2).strength(0.05))
+    .stop();
+
+  const iterations = Math.max(140, Math.min(360, simulationNodes.length * 4));
+  for (let i = 0; i < iterations; i += 1) {
+    simulation.tick();
+  }
+  simulation.stop();
+
+  const padding = 50;
+  return simulationNodes.map(node => ({
+    id: String(node.id),
+    x: Math.max(padding, Math.min(width - padding, node.x ?? width / 2)),
+    y: Math.max(padding, Math.min(height - padding, node.y ?? height / 2)),
+  }));
+}
+
 // Fit the graph to view
 function fitNetworkToView() {
   if (!networkSvg || !networkZoom) return;
@@ -894,6 +928,16 @@ function renderForceNetworkGraph(data, showLabels) {
   // Set up SVG dimensions
   const width = networkContainerEl.clientWidth || 800;
   const height = 500;
+
+  // Compute force positions up front so layout is predictable and easier to compare.
+  const computedPositions = computeNetworkForcePositions(data.nodes, data.links, width, height);
+  const positionById = new Map(computedPositions.map(pos => [pos.id, pos]));
+  data.nodes.forEach(node => {
+    const pos = positionById.get(String(node.id));
+    if (!pos) return;
+    node.x = pos.x;
+    node.y = pos.y;
+  });
 
   // Create SVG with zoom support
   networkSvg = d3.select(networkContainerEl)
