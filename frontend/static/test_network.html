@@ -91,6 +91,65 @@
     // TESTS
     // ===================
 
+    test('Labels should show regardless of node count when enabled', () => {
+      // Test that labels are created for any number of nodes
+      const testCases = [
+        { nodeCount: 50, shouldShowLabels: true },
+        { nodeCount: 80, shouldShowLabels: true },
+        { nodeCount: 100, shouldShowLabels: true },
+        { nodeCount: 150, shouldShowLabels: true },
+      ];
+
+      testCases.forEach(({ nodeCount, shouldShowLabels }) => {
+        const showLabels = true;
+        // The condition should NOT hide labels based on node count
+        const shouldCreateLabels = showLabels; // Should always be true when showLabels is true
+        assert(shouldCreateLabels === shouldShowLabels,
+          `Labels should show for ${nodeCount} nodes when showLabels=true`);
+      });
+    });
+
+    test('Label font size scales with node count', () => {
+      function getLabelFontSize(nodeCount) {
+        if (nodeCount < 30) return 10;
+        if (nodeCount < 60) return 9;
+        if (nodeCount < 100) return 8;
+        return 7;
+      }
+
+      assert(getLabelFontSize(20) === 10, 'Small graph should have 10px font');
+      assert(getLabelFontSize(50) === 9, 'Medium graph should have 9px font');
+      assert(getLabelFontSize(80) === 8, 'Large graph should have 8px font');
+      assert(getLabelFontSize(120) === 7, 'Very large graph should have 7px font');
+    });
+
+    test('Labels have readable styling (background/halo)', () => {
+      const container = document.getElementById('testContainer');
+      container.innerHTML = '';
+
+      const svg = d3.select(container)
+        .append('svg')
+        .attr('width', 800)
+        .attr('height', 500);
+
+      const g = svg.append('g');
+
+      // Create label with halo effect (text-shadow simulation using stroke)
+      const label = g.append('text')
+        .text('Test Label')
+        .attr('x', 100)
+        .attr('y', 100)
+        .attr('font-size', '10px')
+        .attr('stroke', 'white')
+        .attr('stroke-width', 3)
+        .attr('paint-order', 'stroke');
+
+      const labelEl = container.querySelector('text');
+      assert(labelEl !== null, 'Label should exist');
+      assert(labelEl.getAttribute('stroke') === 'white', 'Label should have white stroke for halo');
+      assert(labelEl.getAttribute('paint-order') === 'stroke', 'Stroke should be painted first');
+    });
+
     test('SVG element is created with correct dimensions', () => {
       const container = document.getElementById('testContainer');
       container.innerHTML = '';

@@ -868,19 +868,30 @@ async function renderNetwork() {
     node.append('title')
       .text(d => `${d.name} (${d.party || '?'}-${d.district || '?'})`);
 
-    // Add labels if enabled (only for smaller graphs or when explicitly requested)
+    // Add labels if enabled - scale font size based on node count
     let labels = null;
-    if (showLabels && data.nodes.length < 80) {
+    if (showLabels) {
+      // Calculate font size based on node count
+      let fontSize = 10;
+      if (data.nodes.length >= 100) fontSize = 7;
+      else if (data.nodes.length >= 60) fontSize = 8;
+      else if (data.nodes.length >= 30) fontSize = 9;
+
       labels = networkG.append('g')
         .attr('class', 'labels')
         .selectAll('text')
         .data(data.nodes)
         .join('text')
         .text(d => d.name.split(' ').pop())  // Last name only
-        .attr('font-size', data.nodes.length < 30 ? '10px' : '8px')
-        .attr('dx', 12)
+        .attr('font-size', fontSize + 'px')
+        .attr('font-weight', '500')
+        .attr('dx', 10)
         .attr('dy', 4)
-        .attr('fill', '#374151')
+        .attr('fill', '#1f2937')
+        // Add white halo for readability
+        .attr('stroke', 'white')
+        .attr('stroke-width', 3)
+        .attr('paint-order', 'stroke')
         .style('pointer-events', 'none');
     }
 
