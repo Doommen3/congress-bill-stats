@@ -425,6 +425,33 @@ class TestActionSponsorParsing:
         assert "Rick Ryan" in bill["co_sponsors"]
         assert "Michael J. Coffey Jr." in bill["co_sponsors"]
 
+    SAMPLE_SPONSOR_CHANGED_XML = """<?xml version="1.0" encoding="utf-8"?>
+    <BillStatus>
+      <shortdesc>TEST BILL WITH SPONSOR CHANGE</shortdesc>
+      <actions>
+        <statusdate>12/17/2024</statusdate>
+        <chamber>House</chamber>
+        <action>Prefiled with Clerk by Rep. Emanuel Chris Welch</action>
+        <statusdate>1/8/2025</statusdate>
+        <chamber>House</chamber>
+        <action>First Reading</action>
+        <statusdate>3/18/2025</statusdate>
+        <chamber>House</chamber>
+        <action>Chief Sponsor Changed to Rep. Amy Briel</action>
+        <statusdate>8/15/2025</statusdate>
+        <chamber>House</chamber>
+        <action>Public Act . . . . . . . . . 104-0165</action>
+      </actions>
+    </BillStatus>
+    """
+
+    def test_sponsor_change_overrides_original_filer(self):
+        """Test that Chief Sponsor Changed action updates the primary sponsor."""
+        bill = parse_bill_xml(self.SAMPLE_SPONSOR_CHANGED_XML, "10400HB0871.xml", 104)
+        # Should be Amy Briel (the changed sponsor), not Emanuel Chris Welch (original filer)
+        assert bill["primary_sponsor_name"] == "Amy Briel"
+        assert bill["public_act_number"] == "104-0165"
+
 
 class TestSessionHelpers:
     """Tests for session utility functions."""

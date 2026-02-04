@@ -1295,6 +1295,7 @@ def refresh_status(congress: int = Query(DEFAULT_CONGRESS, ge=81, le=999)):
 def api_il_stats(
     session: int = Query(DEFAULT_IL_SESSION, ge=98, le=999, description="Illinois GA session number"),
     refresh: bool = Query(False, description="Force rebuild and refresh cache."),
+    full: bool = Query(False, description="Full refresh: re-fetch ALL bills (not incremental). Use when sponsor data needs correction."),
     background: bool = Query(False, description="Run refresh in background, return cached data immediately."),
     background_tasks: BackgroundTasks = None,
     request: Request = None,
@@ -1305,8 +1306,9 @@ def api_il_stats(
     - If cached data exists and refresh=False, returns cached data immediately.
     - If refresh=True and background=True, returns cached data and refreshes in background.
     - If refresh=True and background=False, rebuilds stats synchronously.
+    - If full=True, does a non-incremental refresh (re-fetches ALL bills, not just new ones).
     """
-    print(f"[api_il_stats] start session={session} refresh={refresh} background={background}", flush=True)
+    print(f"[api_il_stats] start session={session} refresh={refresh} full={full} background={background}", flush=True)
 
     is_admin = _is_admin_request(request) if request else False
 
@@ -1320,8 +1322,9 @@ def api_il_stats(
         # Check if already refreshing
         status = il_stats.get_il_refresh_status(session)
         if status.get("status") != "running":
-            background_tasks.add_task(il_stats.do_il_background_refresh, session)
-            print(f"[api_il_stats] Started background refresh for IL session {session}", flush=True)
+            incremental = not full
+            background_tasks.add_task(il_stats.do_il_background_refresh, session, incremental)
+            print(f"[api_il_stats] Started background refresh for IL session {session} (incremental={incremental})", flush=True)
 
         # Return cached data with refresh status
         cached["_refresh_status"] = "pending"
@@ -1341,7 +1344,8 @@ def api_il_stats(
         raise HTTPException(status_code=503, detail="Cache not ready. Admin must refresh.")
 
     # Synchronous refresh (admin-only or cache miss for admin)
-    stats = il_stats.build_il_stats(session)
+    incremental = not full
+    stats = il_stats.build_il_stats(session, incremental=incremental)
     il_stats.save_il_cache(session, stats)
     return JSONResponse(stats)
 

@@ -45,6 +45,7 @@ PUBLIC_ACT_PATTERN = re.compile(r'Public\s+Act\s*[.\s]*(\d{3}-\d{4})', re.IGNORE
 
 # Sponsor action patterns (parsed from action text)
 PRIMARY_FILED_PATTERN = re.compile(r'\b(Prefiled|Filed)\b.*\bby\b\s+(.+)$', re.IGNORECASE)
+CHIEF_SPONSOR_CHANGED_PATTERN = re.compile(r'\bChief\s+Sponsor\s+Changed\s+to\b\s+(.+)$', re.IGNORECASE)
 CHIEF_CO_ADD_PATTERN = re.compile(r'\bAdded\s+Chief\s+Co-?Sponsors?\b', re.IGNORECASE)
 CO_ADD_PATTERN = re.compile(r'\bAdded\s+Co-?Sponsors?\b', re.IGNORECASE)
 CHIEF_CO_REMOVE_PATTERN = re.compile(r'\bRemoved\s+Chief\s+Co-?Sponsors?\b', re.IGNORECASE)
@@ -251,28 +252,55 @@ def _extract_names_from_action(text: str, pattern: re.Pattern) -> List[str]:
 
 
 def _extract_primary_sponsor_from_actions(actions: List[Dict[str, Any]]) -> Optional[str]:
-    """Find the first filed/prefiled action and extract the sponsor name."""
-    candidates = []
+    """
+    Extract the current primary sponsor from actions.
+
+    Checks for:
+    1. "Chief Sponsor Changed to X" actions (use the LATEST one if multiple)
+    2. "Filed/Prefiled by X" actions (use as fallback if no sponsor change)
+
+    If the sponsor changed after filing, we use the new sponsor.
+    """
+    filed_candidates = []
+    sponsor_changes = []
+
     for idx, action in enumerate(actions):
         text = _normalize_action_text(action.get("text", ""))
         if not text:
             continue
-        match = PRIMARY_FILED_PATTERN.search(text)
-        if not match:
-            continue
-        name_text = _strip_action_suffixes(match.group(2) or "")
-        if not re.search(r'(Rep\.|Sen\.|Representative|Senator)', name_text, re.IGNORECASE):
-            continue
-        cleaned = _strip_title_prefix(name_text)
-        if cleaned:
-            candidates.append((_parse_action_date(action.get("date", "")), idx, cleaned))
 
-    if not candidates:
-        return None
+        action_date = _parse_action_date(action.get("date", ""))
 
-    # Sort by earliest date, then document order
-    candidates.sort(key=lambda item: (item[0] is None, item[0] or datetime.max, item[1]))
-    return candidates[0][2]
+        # Check for "Chief Sponsor Changed to X"
+        change_match = CHIEF_SPONSOR_CHANGED_PATTERN.search(text)
+        if change_match:
+            name_text = _strip_action_suffixes(change_match.group(1) or "")
+            cleaned = _strip_title_prefix(name_text)
+            if cleaned:
+                sponsor_changes.append((action_date, idx, cleaned))
+            continue
+
+        # Check for original "Filed/Prefiled by X"
+        filed_match = PRIMARY_FILED_PATTERN.search(text)
+        if filed_match:
+            name_text = _strip_action_suffixes(filed_match.group(2) or "")
+            if not re.search(r'(Rep\.|Sen\.|Representative|Senator)', name_text, re.IGNORECASE):
+                continue
+            cleaned = _strip_title_prefix(name_text)
+            if cleaned:
+                filed_candidates.append((action_date, idx, cleaned))
+
+    # If there are sponsor changes, use the LATEST one (most recent date/index)
+    if sponsor_changes:
+        sponsor_changes.sort(key=lambda item: (item[0] is None, item[0] or datetime.min, item[1]), reverse=True)
+        return sponsor_changes[0][2]
+
+    # Otherwise, use the earliest filed sponsor
+    if filed_candidates:
+        filed_candidates.sort(key=lambda item: (item[0] is None, item[0] or datetime.max, item[1]))
+        return filed_candidates[0][2]
+
+    return None
 
 
 def _parse_actions(root: ET.Element) -> List[Dict[str, Any]]:
@@ -1275,12 +1303,12 @@ def build_il_stats(ga_session: int, incremental: bool = True) -> Dict[str, Any]:
 # =======================
 # Background refresh
 # =======================
-def do_il_background_refresh(ga_session: int):
+def do_il_background_refresh(ga_session: int, incremental: bool = True):
     """Run Illinois stats refresh in background, updating status."""
     global _il_refresh_status
-    _il_refresh_status[ga_session] = {"status": "running", "started_at": int(time.time())}
+    _il_refresh_status[ga_session] = {"status": "running", "started_at": int(time.time()), "incremental": incremental}
     try:
-        stats = build_il_stats(ga_session)
+        stats = build_il_stats(ga_session, incremental=incremental)
         save_il_cache(ga_session, stats)
         _il_refresh_status[ga_session] = {
             "status": "completed",
