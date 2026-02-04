@@ -12,6 +12,10 @@ from contextlib import contextmanager
 # Database path - uses same database as Congress stats
 DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "congress_stats.db"))
 
+NETWORK_VIEW_NETWORK = "network"
+NETWORK_VIEW_EDGE_BUNDLING = "edge_bundling"
+NETWORK_VIEWS = {NETWORK_VIEW_NETWORK, NETWORK_VIEW_EDGE_BUNDLING}
+
 
 @contextmanager
 def get_db_connection():
@@ -611,11 +615,101 @@ def _get_name_parts(name: str) -> tuple:
     return (name, name)
 
 
-def get_il_network_data(ga_session: int, min_connections: int = 3) -> Dict[str, Any]:
+def _normalize_network_view(view: Optional[str]) -> str:
+    """Normalize graph view mode."""
+    if not view:
+        return NETWORK_VIEW_NETWORK
+    mode = view.strip().lower()
+    if mode in NETWORK_VIEWS:
+        return mode
+    return NETWORK_VIEW_NETWORK
+
+
+def _link_endpoint_id(endpoint: Any) -> Optional[str]:
+    """Extract endpoint ID from a raw link endpoint value."""
+    if isinstance(endpoint, dict):
+        endpoint = endpoint.get("id")
+    if endpoint is None:
+        return None
+    return str(endpoint)
+
+
+def build_il_edge_bundling_hierarchy(nodes: List[Dict[str, Any]], links: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Build a chamber -> party -> legislator hierarchy for hierarchical edge bundling.
+    Leaf nodes include `connection_ids` so the UI can map bundled relationships.
+    """
+    grouped: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    connections_by_id: Dict[str, set] = {}
+
+    for node in nodes:
+        node_id = _link_endpoint_id(node.get("id"))
+        if not node_id:
+            continue
+        chamber = str(node.get("chamber") or "other").strip().lower() or "other"
+        party = str(node.get("party") or "other").strip().upper() or "other"
+        grouped.setdefault(chamber, {}).setdefault(party, []).append(node)
+        connections_by_id.setdefault(node_id, set())
+
+    for link in links:
+        source_id = _link_endpoint_id(link.get("source"))
+        target_id = _link_endpoint_id(link.get("target"))
+        if not source_id or not target_id or source_id == target_id:
+            continue
+        if source_id not in connections_by_id or target_id not in connections_by_id:
+            continue
+        connections_by_id[source_id].add(target_id)
+        connections_by_id[target_id].add(source_id)
+
+    chamber_order = {"house": 0, "senate": 1}
+    party_order = {"D": 0, "R": 1}
+
+    root: Dict[str, Any] = {"name": "Illinois GA", "children": []}
+
+    for chamber in sorted(grouped.keys(), key=lambda c: (chamber_order.get(c, 99), c)):
+        chamber_node: Dict[str, Any] = {
+            "name": chamber.title(),
+            "key": chamber,
+            "children": [],
+        }
+        parties = grouped[chamber]
+        for party in sorted(parties.keys(), key=lambda p: (party_order.get(p, 99), p)):
+            party_node: Dict[str, Any] = {
+                "name": party,
+                "key": party,
+                "children": [],
+            }
+            for member in sorted(parties[party], key=lambda m: (str(m.get("name") or ""), str(m.get("id") or ""))):
+                member_id = _link_endpoint_id(member.get("id"))
+                if not member_id:
+                    continue
+                party_node["children"].append({
+                    "name": member.get("name") or member_id,
+                    "id": member_id,
+                    "party": member.get("party"),
+                    "chamber": member.get("chamber"),
+                    "district": member.get("district"),
+                    "connection_ids": sorted(connections_by_id.get(member_id, set())),
+                })
+            if party_node["children"]:
+                chamber_node["children"].append(party_node)
+        if chamber_node["children"]:
+            root["children"].append(chamber_node)
+
+    return root
+
+
+def get_il_network_data(
+    ga_session: int,
+    min_connections: int = 3,
+    view: str = NETWORK_VIEW_NETWORK,
+) -> Dict[str, Any]:
     """
     Get co-sponsor network data for D3.js visualization.
     Returns nodes (legislators) and links (co-sponsorship relationships).
     """
+    normalized_view = _normalize_network_view(view)
+
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
@@ -745,12 +839,19 @@ def get_il_network_data(ga_session: int, min_connections: int = 3) -> Dict[str, 
                 "value": count,
             })
 
-        return {
+        nodes.sort(key=lambda n: (str(n.get("chamber") or ""), str(n.get("party") or ""), str(n.get("name") or ""), str(n.get("id") or "")))
+        links.sort(key=lambda l: (str(l.get("source") or ""), str(l.get("target") or "")))
+
+        payload: Dict[str, Any] = {
             "ga_session": ga_session,
             "nodes": nodes,
             "links": links,
             "min_connections": min_connections,
+            "view": normalized_view,
         }
+        if normalized_view == NETWORK_VIEW_EDGE_BUNDLING:
+            payload["hierarchy"] = build_il_edge_bundling_hierarchy(nodes, links)
+        return payload
 
 
 # Initialize IL database tables on module import

@@ -705,6 +705,49 @@ class TestILAPIEndpoints:
         assert response.status_code == 200
         mock_build.assert_called_once()
 
+    @patch("illinois_database.get_il_network_data")
+    def test_il_network_endpoint_defaults_to_network_view(self, mock_get_network, client):
+        """Network endpoint should default to the force-directed graph payload."""
+        mock_get_network.return_value = {
+            "ga_session": 104,
+            "nodes": [],
+            "links": [],
+            "min_connections": 3,
+            "view": "network",
+        }
+
+        response = client.get("/api/il-network?session=104")
+        assert response.status_code == 200
+
+        mock_get_network.assert_called_once_with(104, min_connections=3, view="network")
+        payload = response.json()
+        assert payload["view"] == "network"
+
+    @patch("illinois_database.get_il_network_data")
+    def test_il_network_endpoint_edge_bundling_view(self, mock_get_network, client):
+        """Network endpoint should forward edge-bundling view selection."""
+        mock_get_network.return_value = {
+            "ga_session": 104,
+            "nodes": [],
+            "links": [],
+            "min_connections": 2,
+            "view": "edge_bundling",
+            "hierarchy": {"name": "Illinois GA", "children": []},
+        }
+
+        response = client.get("/api/il-network?session=104&min_connections=2&view=edge_bundling")
+        assert response.status_code == 200
+
+        mock_get_network.assert_called_once_with(104, min_connections=2, view="edge_bundling")
+        payload = response.json()
+        assert payload["view"] == "edge_bundling"
+        assert "hierarchy" in payload
+
+    def test_il_network_endpoint_rejects_invalid_view(self, client):
+        """Invalid view should fail validation at the API layer."""
+        response = client.get("/api/il-network?session=104&view=invalid")
+        assert response.status_code == 422
+
 
 class TestILIncrementalMerge:
     @patch("illinois_stats.il_db.update_il_bill")

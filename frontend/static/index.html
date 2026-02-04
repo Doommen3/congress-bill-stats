@@ -125,8 +125,15 @@
 
     <!-- Co-sponsor Network (Illinois only) -->
     <section id="networkSection" class="network-section mb" style="display: none;">
-      <h3 class="section-title">Co-sponsor Network</h3>
+      <h3 class="section-title">Co-sponsor Graph</h3>
       <div class="network-controls">
+        <label>
+          Graph type:
+          <select id="networkGraphMode">
+            <option value="network">Network analysis</option>
+            <option value="edge_bundling">Hierarchical edge bundling</option>
+          </select>
+        </label>
         <label><input type="checkbox" id="networkShowLabels" checked> Show names</label>
         <label>Min connections: <input type="number" id="networkMinConnections" value="3" min="1" max="20" style="width: 60px;"></label>
         <button id="networkRefresh" class="btn secondary">Refresh</button>
@@ -137,7 +144,7 @@
         </span>
       </div>
       <div id="networkContainer" class="network-container"></div>
-      <p class="network-hint muted tiny">Drag to pan, scroll to zoom. Click "Fit" to see all nodes.</p>
+      <p id="networkHint" class="network-hint muted tiny">Drag to pan, scroll to zoom. Click "Fit" to see all nodes.</p>
     </section>
 
     <div class="card">

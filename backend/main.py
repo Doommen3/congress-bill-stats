@@ -1384,17 +1384,19 @@ def api_il_timeline(
 def api_il_network(
     session: int = Query(DEFAULT_IL_SESSION, ge=98, le=999, description="Illinois GA session number"),
     min_connections: int = Query(3, ge=1, le=50, description="Minimum co-sponsorship connections to include"),
+    view: str = Query("network", pattern="^(network|edge_bundling)$", description="Graph view mode"),
 ):
     """
     Get Illinois co-sponsor network data for D3.js visualization.
     Returns nodes (legislators) and links (co-sponsorship relationships).
+    For `view=edge_bundling`, also returns a hierarchical grouping payload.
     """
     try:
         from . import illinois_database as il_db
     except ImportError:
         import illinois_database as il_db
 
-    data = il_db.get_il_network_data(session, min_connections=min_connections)
+    data = il_db.get_il_network_data(session, min_connections=min_connections, view=view)
     return JSONResponse(data)
 
 

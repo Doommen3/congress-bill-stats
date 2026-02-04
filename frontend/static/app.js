@@ -51,6 +51,38 @@ const leaderboardTabs = document.querySelectorAll('.lb-tab');
 let currentLeaderboard = 'sponsored';
 
 // ==========================================
+// DOM Elements - Illinois Graph
+// ==========================================
+const networkSectionEl = document.getElementById('networkSection');
+const networkContainerEl = document.getElementById('networkContainer');
+const networkHintEl = document.getElementById('networkHint');
+const networkRefreshBtn = document.getElementById('networkRefresh');
+const networkShowLabelsEl = document.getElementById('networkShowLabels');
+const networkMinConnectionsEl = document.getElementById('networkMinConnections');
+const networkGraphModeEl = document.getElementById('networkGraphMode');
+const networkZoomInBtn = document.getElementById('networkZoomIn');
+const networkZoomOutBtn = document.getElementById('networkZoomOut');
+const networkFitViewBtn = document.getElementById('networkFitView');
+
+const NETWORK_VIEW = 'network';
+const EDGE_BUNDLING_VIEW = 'edge_bundling';
+const NETWORK_VIEW_STORAGE_KEY = 'il_graph_mode';
+let currentNetworkView = NETWORK_VIEW;
+
+try {
+  const savedView = localStorage.getItem(NETWORK_VIEW_STORAGE_KEY);
+  if (savedView === EDGE_BUNDLING_VIEW) {
+    currentNetworkView = EDGE_BUNDLING_VIEW;
+  }
+} catch (err) {
+  // Ignore localStorage access failures (private mode / strict browser settings).
+}
+
+if (networkGraphModeEl) {
+  networkGraphModeEl.value = currentNetworkView;
+}
+
+// ==========================================
 // Utility Functions
 // ==========================================
 function fmt(n) { return new Intl.NumberFormat().format(n); }
@@ -266,7 +298,7 @@ function render() {
     renderCongress();
     // Hide Illinois-specific sections
     document.getElementById('timelineSection').style.display = 'none';
-    document.getElementById('networkSection').style.display = 'none';
+    networkSectionEl.style.display = 'none';
   } else {
     renderIllinois();
     // Show and render Illinois-specific visualizations
@@ -715,6 +747,94 @@ let networkSvg = null;
 let networkG = null;
 let networkNodes = null;
 
+function networkPartyColor(party) {
+  const p = (party || '').toUpperCase();
+  if (p === 'D') return '#3b82f6';
+  if (p === 'R') return '#ef4444';
+  return '#6b7280';
+}
+
+function parseNetworkLinkEndpointId(endpoint) {
+  if (endpoint && typeof endpoint === 'object') {
+    return endpoint.id ? String(endpoint.id) : '';
+  }
+  return endpoint == null ? '' : String(endpoint);
+}
+
+function buildEdgeBundlingHierarchy(data) {
+  const grouped = {};
+  const connectionMap = new Map();
+
+  (data.nodes || []).forEach(node => {
+    const id = parseNetworkLinkEndpointId(node.id);
+    if (!id) return;
+    const chamber = (node.chamber || 'other').toLowerCase();
+    const party = (node.party || 'other').toUpperCase();
+    if (!grouped[chamber]) grouped[chamber] = {};
+    if (!grouped[chamber][party]) grouped[chamber][party] = [];
+    grouped[chamber][party].push(node);
+    if (!connectionMap.has(id)) {
+      connectionMap.set(id, new Set());
+    }
+  });
+
+  (data.links || []).forEach(link => {
+    const source = parseNetworkLinkEndpointId(link.source);
+    const target = parseNetworkLinkEndpointId(link.target);
+    if (!source || !target || source === target) return;
+    if (!connectionMap.has(source) || !connectionMap.has(target)) return;
+    connectionMap.get(source).add(target);
+    connectionMap.get(target).add(source);
+  });
+
+  const chamberOrder = { house: 0, senate: 1 };
+  const partyOrder = { D: 0, R: 1 };
+  const root = { name: 'Illinois GA', children: [] };
+
+  Object.keys(grouped)
+    .sort((a, b) => (chamberOrder[a] ?? 99) - (chamberOrder[b] ?? 99) || a.localeCompare(b))
+    .forEach(chamber => {
+      const chamberNode = { name: chamber[0].toUpperCase() + chamber.slice(1), key: chamber, children: [] };
+      Object.keys(grouped[chamber])
+        .sort((a, b) => (partyOrder[a] ?? 99) - (partyOrder[b] ?? 99) || a.localeCompare(b))
+        .forEach(party => {
+          const partyNode = { name: party, key: party, children: [] };
+          grouped[chamber][party]
+            .slice()
+            .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+            .forEach(member => {
+              const id = parseNetworkLinkEndpointId(member.id);
+              if (!id) return;
+              partyNode.children.push({
+                name: member.name || id,
+                id,
+                party: member.party,
+                chamber: member.chamber,
+                district: member.district,
+                connection_ids: Array.from(connectionMap.get(id) || []).sort(),
+              });
+            });
+          if (partyNode.children.length) {
+            chamberNode.children.push(partyNode);
+          }
+        });
+      if (chamberNode.children.length) {
+        root.children.push(chamberNode);
+      }
+    });
+
+  return root;
+}
+
+function updateNetworkHint() {
+  if (!networkHintEl) return;
+  if (currentNetworkView === EDGE_BUNDLING_VIEW) {
+    networkHintEl.textContent = 'Hierarchical edge bundling view. Drag to pan, scroll to zoom, and use Fit to reset.';
+    return;
+  }
+  networkHintEl.textContent = 'Drag to pan, scroll to zoom. Click "Fit" to see all nodes.';
+}
+
 // Scale force parameters based on node count
 function getNetworkForceParams(nodeCount) {
   if (nodeCount < 20) return { charge: -300, distance: 100, collision: 25 };
@@ -725,10 +845,16 @@ function getNetworkForceParams(nodeCount) {
 
 // Fit the graph to view
 function fitNetworkToView() {
-  if (!networkSvg || !networkG || !networkNodes || !networkNodes.length) return;
+  if (!networkSvg || !networkZoom) return;
+  if (currentNetworkView === EDGE_BUNDLING_VIEW) {
+    networkSvg.transition()
+      .duration(400)
+      .call(networkZoom.transform, d3.zoomIdentity);
+    return;
+  }
+  if (!networkG || !networkNodes || !networkNodes.length) return;
 
-  const container = document.getElementById('networkContainer');
-  const width = container.clientWidth || 800;
+  const width = networkContainerEl.clientWidth || 800;
   const height = 500;
   const padding = 50;
 
@@ -736,7 +862,7 @@ function fitNetworkToView() {
   const xExtent = d3.extent(networkNodes, d => d.x);
   const yExtent = d3.extent(networkNodes, d => d.y);
 
-  if (!xExtent[0] || !yExtent[0]) return;
+  if (xExtent[0] == null || yExtent[0] == null) return;
 
   const graphWidth = xExtent[1] - xExtent[0] || 1;
   const graphHeight = yExtent[1] - yExtent[0] || 1;
@@ -761,188 +887,307 @@ function fitNetworkToView() {
     .call(networkZoom.transform, d3.zoomIdentity.translate(translateX, translateY).scale(scale));
 }
 
-async function renderNetwork() {
-  const section = document.getElementById('networkSection');
-  if (currentLegislature !== 'illinois') {
-    section.style.display = 'none';
+function renderForceNetworkGraph(data, showLabels) {
+  // Store nodes reference for fit-to-view
+  networkNodes = data.nodes;
+
+  // Set up SVG dimensions
+  const width = networkContainerEl.clientWidth || 800;
+  const height = 500;
+
+  // Create SVG with zoom support
+  networkSvg = d3.select(networkContainerEl)
+    .append('svg')
+    .attr('width', width)
+    .attr('height', height)
+    .attr('viewBox', [0, 0, width, height])
+    .style('cursor', 'grab');
+
+  // Create a group for all zoomable content
+  networkG = networkSvg.append('g').attr('class', 'zoom-group');
+
+  // Set up zoom behavior
+  networkZoom = d3.zoom()
+    .scaleExtent([0.1, 4])
+    .on('zoom', (event) => {
+      networkG.attr('transform', event.transform);
+    });
+
+  networkSvg.call(networkZoom);
+
+  // Get force parameters based on node count
+  const forceParams = getNetworkForceParams(data.nodes.length);
+
+  // Create simulation
+  if (networkSimulation) {
+    networkSimulation.stop();
+  }
+
+  networkSimulation = d3.forceSimulation(data.nodes)
+    .force('link', d3.forceLink(data.links).id(d => d.id).distance(forceParams.distance))
+    .force('charge', d3.forceManyBody().strength(forceParams.charge))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide().radius(forceParams.collision))
+    .force('x', d3.forceX(width / 2).strength(0.05))
+    .force('y', d3.forceY(height / 2).strength(0.05));
+
+  // Draw links
+  const link = networkG.append('g')
+    .attr('class', 'links')
+    .selectAll('line')
+    .data(data.links)
+    .join('line')
+    .attr('stroke', '#999')
+    .attr('stroke-opacity', 0.6)
+    .attr('stroke-width', d => Math.sqrt(d.value));
+
+  // Draw nodes
+  const node = networkG.append('g')
+    .attr('class', 'nodes')
+    .selectAll('circle')
+    .data(data.nodes)
+    .join('circle')
+    .attr('r', Math.max(5, 10 - data.nodes.length / 30))
+    .attr('fill', d => networkPartyColor(d.party))
+    .attr('stroke', '#fff')
+    .attr('stroke-width', 1.5)
+    .style('cursor', 'pointer')
+    .call(d3.drag()
+      .on('start', dragstarted)
+      .on('drag', dragged)
+      .on('end', dragended));
+
+  // Add tooltips
+  node.append('title')
+    .text(d => `${d.name} (${d.party || '?'}-${d.district || '?'})`);
+
+  // Add labels if enabled - scale font size based on node count
+  let labels = null;
+  if (showLabels) {
+    // Calculate font size based on node count
+    let fontSize = 10;
+    if (data.nodes.length >= 100) fontSize = 7;
+    else if (data.nodes.length >= 60) fontSize = 8;
+    else if (data.nodes.length >= 30) fontSize = 9;
+
+    labels = networkG.append('g')
+      .attr('class', 'labels')
+      .selectAll('text')
+      .data(data.nodes)
+      .join('text')
+      .text(d => (d.name || '').split(' ').pop())  // Last name only
+      .attr('font-size', fontSize + 'px')
+      .attr('font-weight', '500')
+      .attr('dx', 10)
+      .attr('dy', 4)
+      .attr('fill', '#1f2937')
+      // Add white halo for readability
+      .attr('stroke', 'white')
+      .attr('stroke-width', 3)
+      .attr('paint-order', 'stroke')
+      .style('pointer-events', 'none');
+  }
+
+  // Update positions on tick with boundary awareness
+  const padding = 50;
+  networkSimulation.on('tick', () => {
+    // Soft boundary constraint (pull towards center if too far)
+    data.nodes.forEach(d => {
+      d.x = Math.max(padding, Math.min(width - padding, d.x));
+      d.y = Math.max(padding, Math.min(height - padding, d.y));
+    });
+
+    link
+      .attr('x1', d => d.source.x)
+      .attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x)
+      .attr('y2', d => d.target.y);
+
+    node
+      .attr('cx', d => d.x)
+      .attr('cy', d => d.y);
+
+    if (labels) {
+      labels
+        .attr('x', d => d.x)
+        .attr('y', d => d.y);
+    }
+  });
+
+  // Auto fit-to-view after simulation stabilizes
+  networkSimulation.on('end', () => {
+    setTimeout(fitNetworkToView, 100);
+  });
+
+  function dragstarted(event, d) {
+    if (!event.active) networkSimulation.alphaTarget(0.3).restart();
+    d.fx = d.x;
+    d.fy = d.y;
+  }
+
+  function dragged(event, d) {
+    d.fx = event.x;
+    d.fy = event.y;
+  }
+
+  function dragended(event, d) {
+    if (!event.active) networkSimulation.alphaTarget(0);
+    d.fx = null;
+    d.fy = null;
+  }
+}
+
+function renderEdgeBundlingGraph(data, showLabels) {
+  if (networkSimulation) {
+    networkSimulation.stop();
+    networkSimulation = null;
+  }
+  networkNodes = null;
+
+  const width = networkContainerEl.clientWidth || 800;
+  const height = 500;
+  const radius = Math.max(120, Math.min(width, height) / 2 - 80);
+  const hierarchyData = data.hierarchy || buildEdgeBundlingHierarchy(data);
+
+  networkSvg = d3.select(networkContainerEl)
+    .append('svg')
+    .attr('width', width)
+    .attr('height', height)
+    .attr('viewBox', [0, 0, width, height])
+    .style('cursor', 'grab');
+
+  networkG = networkSvg.append('g').attr('class', 'zoom-group');
+
+  networkZoom = d3.zoom()
+    .scaleExtent([0.4, 5])
+    .on('zoom', (event) => {
+      networkG.attr('transform', event.transform);
+    });
+
+  networkSvg.call(networkZoom);
+
+  const plot = networkG.append('g')
+    .attr('transform', `translate(${width / 2},${height / 2})`);
+
+  const root = d3.hierarchy(hierarchyData)
+    .sort((a, b) => String(a.data.name || '').localeCompare(String(b.data.name || '')));
+
+  d3.cluster()
+    .size([Math.PI * 2, radius])(root);
+
+  const leaves = root.leaves();
+  if (!leaves.length) {
+    networkContainerEl.innerHTML = '<p class="muted">No hierarchical groups available for edge bundling.</p>';
     return;
   }
-  section.style.display = 'block';
+  const leafById = new Map(leaves.map(leaf => [leaf.data.id, leaf]));
+  const bundledEdges = [];
+
+  (data.links || []).forEach(link => {
+    const sourceId = parseNetworkLinkEndpointId(link.source);
+    const targetId = parseNetworkLinkEndpointId(link.target);
+    if (!sourceId || !targetId || sourceId === targetId) return;
+
+    const sourceLeaf = leafById.get(sourceId);
+    const targetLeaf = leafById.get(targetId);
+    if (!sourceLeaf || !targetLeaf) return;
+
+    bundledEdges.push({
+      path: sourceLeaf.path(targetLeaf),
+      value: Number(link.value) || 1,
+    });
+  });
+
+  const radialLine = d3.lineRadial()
+    .curve(d3.curveBundle.beta(0.85))
+    .radius(d => d.y)
+    .angle(d => d.x - Math.PI / 2);
+
+  plot.append('g')
+    .attr('class', 'bundle-links')
+    .selectAll('path')
+    .data(bundledEdges)
+    .join('path')
+    .attr('fill', 'none')
+    .attr('stroke', '#9ca3af')
+    .attr('stroke-width', d => 0.7 + Math.log2(d.value + 1) * 0.5)
+    .attr('stroke-opacity', d => Math.min(0.8, 0.15 + Math.log2(d.value + 1) * 0.12))
+    .attr('d', d => radialLine(d.path));
+
+  const leafNodes = plot.append('g')
+    .attr('class', 'bundle-nodes')
+    .selectAll('circle')
+    .data(leaves)
+    .join('circle')
+    .attr('r', 3.5)
+    .attr('transform', d => `rotate(${(d.x * 180 / Math.PI) - 90}) translate(${d.y},0)`)
+    .attr('fill', d => networkPartyColor(d.data.party))
+    .attr('stroke', '#fff')
+    .attr('stroke-width', 1);
+
+  leafNodes.append('title')
+    .text(d => `${d.data.name} (${d.data.party || '?'}-${d.data.district || '?'})`);
+
+  if (showLabels) {
+    plot.append('g')
+      .attr('class', 'bundle-labels')
+      .selectAll('text')
+      .data(leaves)
+      .join('text')
+      .attr('transform', d => {
+        const rotate = (d.x * 180 / Math.PI) - 90;
+        const flip = d.x >= Math.PI ? 180 : 0;
+        return `rotate(${rotate}) translate(${d.y + 8},0) rotate(${flip})`;
+      })
+      .attr('text-anchor', d => d.x < Math.PI ? 'start' : 'end')
+      .attr('font-size', '8px')
+      .attr('font-weight', '500')
+      .attr('fill', '#1f2937')
+      .attr('stroke', 'white')
+      .attr('stroke-width', 3)
+      .attr('paint-order', 'stroke')
+      .style('pointer-events', 'none')
+      .text(d => (d.data.name || '').split(' ').pop());
+  }
+
+  fitNetworkToView();
+}
+
+async function renderNetwork() {
+  if (currentLegislature !== 'illinois') {
+    networkSectionEl.style.display = 'none';
+    return;
+  }
+  networkSectionEl.style.display = 'block';
 
   const session = parseInt(ilSessionSelect.value || '104', 10);
-  const minConnections = parseInt(document.getElementById('networkMinConnections').value || '3', 10);
-  const showLabels = document.getElementById('networkShowLabels').checked;
+  const minConnections = parseInt(networkMinConnectionsEl.value || '3', 10);
+  const showLabels = networkShowLabelsEl.checked;
+  currentNetworkView = (networkGraphModeEl && networkGraphModeEl.value === EDGE_BUNDLING_VIEW)
+    ? EDGE_BUNDLING_VIEW
+    : NETWORK_VIEW;
+  updateNetworkHint();
 
   try {
-    const resp = await fetch(`/api/il-network?session=${encodeURIComponent(session)}&min_connections=${minConnections}`);
+    const resp = await fetch(
+      `/api/il-network?session=${encodeURIComponent(session)}&min_connections=${minConnections}&view=${encodeURIComponent(currentNetworkView)}`
+    );
     if (!resp.ok) return;
     const data = await resp.json();
 
-    const container = document.getElementById('networkContainer');
-    container.innerHTML = '';
+    networkContainerEl.innerHTML = '';
 
     if (!data.nodes.length) {
-      container.innerHTML = '<p class="muted">No co-sponsor connections found with minimum ' + minConnections + ' shared bills.</p>';
+      networkContainerEl.innerHTML = '<p class="muted">No co-sponsor connections found with minimum ' + minConnections + ' shared bills.</p>';
       networkNodes = null;
       return;
     }
 
-    // Store nodes reference for fit-to-view
-    networkNodes = data.nodes;
-
-    // Set up SVG dimensions
-    const width = container.clientWidth || 800;
-    const height = 500;
-
-    // Create SVG with zoom support
-    networkSvg = d3.select(container)
-      .append('svg')
-      .attr('width', width)
-      .attr('height', height)
-      .attr('viewBox', [0, 0, width, height])
-      .style('cursor', 'grab');
-
-    // Create a group for all zoomable content
-    networkG = networkSvg.append('g').attr('class', 'zoom-group');
-
-    // Set up zoom behavior
-    networkZoom = d3.zoom()
-      .scaleExtent([0.1, 4])
-      .on('zoom', (event) => {
-        networkG.attr('transform', event.transform);
-      });
-
-    networkSvg.call(networkZoom);
-
-    // Color scale by party
-    const partyColor = (party) => {
-      const p = (party || '').toUpperCase();
-      if (p === 'D') return '#3b82f6';
-      if (p === 'R') return '#ef4444';
-      return '#6b7280';
-    };
-
-    // Get force parameters based on node count
-    const forceParams = getNetworkForceParams(data.nodes.length);
-
-    // Create simulation
-    if (networkSimulation) {
-      networkSimulation.stop();
+    if (currentNetworkView === EDGE_BUNDLING_VIEW) {
+      renderEdgeBundlingGraph(data, showLabels);
+    } else {
+      renderForceNetworkGraph(data, showLabels);
     }
-
-    networkSimulation = d3.forceSimulation(data.nodes)
-      .force('link', d3.forceLink(data.links).id(d => d.id).distance(forceParams.distance))
-      .force('charge', d3.forceManyBody().strength(forceParams.charge))
-      .force('center', d3.forceCenter(width / 2, height / 2))
-      .force('collision', d3.forceCollide().radius(forceParams.collision))
-      .force('x', d3.forceX(width / 2).strength(0.05))
-      .force('y', d3.forceY(height / 2).strength(0.05));
-
-    // Draw links
-    const link = networkG.append('g')
-      .attr('class', 'links')
-      .selectAll('line')
-      .data(data.links)
-      .join('line')
-      .attr('stroke', '#999')
-      .attr('stroke-opacity', 0.6)
-      .attr('stroke-width', d => Math.sqrt(d.value));
-
-    // Draw nodes
-    const node = networkG.append('g')
-      .attr('class', 'nodes')
-      .selectAll('circle')
-      .data(data.nodes)
-      .join('circle')
-      .attr('r', Math.max(5, 10 - data.nodes.length / 30))
-      .attr('fill', d => partyColor(d.party))
-      .attr('stroke', '#fff')
-      .attr('stroke-width', 1.5)
-      .style('cursor', 'pointer')
-      .call(d3.drag()
-        .on('start', dragstarted)
-        .on('drag', dragged)
-        .on('end', dragended));
-
-    // Add tooltips
-    node.append('title')
-      .text(d => `${d.name} (${d.party || '?'}-${d.district || '?'})`);
-
-    // Add labels if enabled - scale font size based on node count
-    let labels = null;
-    if (showLabels) {
-      // Calculate font size based on node count
-      let fontSize = 10;
-      if (data.nodes.length >= 100) fontSize = 7;
-      else if (data.nodes.length >= 60) fontSize = 8;
-      else if (data.nodes.length >= 30) fontSize = 9;
-
-      labels = networkG.append('g')
-        .attr('class', 'labels')
-        .selectAll('text')
-        .data(data.nodes)
-        .join('text')
-        .text(d => d.name.split(' ').pop())  // Last name only
-        .attr('font-size', fontSize + 'px')
-        .attr('font-weight', '500')
-        .attr('dx', 10)
-        .attr('dy', 4)
-        .attr('fill', '#1f2937')
-        // Add white halo for readability
-        .attr('stroke', 'white')
-        .attr('stroke-width', 3)
-        .attr('paint-order', 'stroke')
-        .style('pointer-events', 'none');
-    }
-
-    // Update positions on tick with boundary awareness
-    const padding = 50;
-    networkSimulation.on('tick', () => {
-      // Soft boundary constraint (pull towards center if too far)
-      data.nodes.forEach(d => {
-        d.x = Math.max(padding, Math.min(width - padding, d.x));
-        d.y = Math.max(padding, Math.min(height - padding, d.y));
-      });
-
-      link
-        .attr('x1', d => d.source.x)
-        .attr('y1', d => d.source.y)
-        .attr('x2', d => d.target.x)
-        .attr('y2', d => d.target.y);
-
-      node
-        .attr('cx', d => d.x)
-        .attr('cy', d => d.y);
-
-      if (labels) {
-        labels
-          .attr('x', d => d.x)
-          .attr('y', d => d.y);
-      }
-    });
-
-    // Auto fit-to-view after simulation stabilizes
-    networkSimulation.on('end', () => {
-      setTimeout(fitNetworkToView, 100);
-    });
-
-    function dragstarted(event, d) {
-      if (!event.active) networkSimulation.alphaTarget(0.3).restart();
-      d.fx = d.x;
-      d.fy = d.y;
-    }
-
-    function dragged(event, d) {
-      d.fx = event.x;
-      d.fy = event.y;
-    }
-
-    function dragended(event, d) {
-      if (!event.active) networkSimulation.alphaTarget(0);
-      d.fx = null;
-      d.fy = null;
-    }
-
   } catch (e) {
     console.error('Error loading network:', e);
   }
@@ -964,14 +1209,27 @@ function networkZoomOut() {
 // ==========================================
 // Event Handlers - Timeline & Network
 // ==========================================
-document.getElementById('networkRefresh').addEventListener('click', renderNetwork);
-document.getElementById('networkShowLabels').addEventListener('change', renderNetwork);
-document.getElementById('networkMinConnections').addEventListener('change', renderNetwork);
-document.getElementById('networkZoomIn').addEventListener('click', networkZoomIn);
-document.getElementById('networkZoomOut').addEventListener('click', networkZoomOut);
-document.getElementById('networkFitView').addEventListener('click', fitNetworkToView);
+networkRefreshBtn.addEventListener('click', renderNetwork);
+networkShowLabelsEl.addEventListener('change', renderNetwork);
+networkMinConnectionsEl.addEventListener('change', renderNetwork);
+networkZoomInBtn.addEventListener('click', networkZoomIn);
+networkZoomOutBtn.addEventListener('click', networkZoomOut);
+networkFitViewBtn.addEventListener('click', fitNetworkToView);
+networkGraphModeEl.addEventListener('change', () => {
+  currentNetworkView = networkGraphModeEl.value === EDGE_BUNDLING_VIEW ? EDGE_BUNDLING_VIEW : NETWORK_VIEW;
+  try {
+    localStorage.setItem(NETWORK_VIEW_STORAGE_KEY, currentNetworkView);
+  } catch (err) {
+    // Ignore localStorage write failures.
+  }
+  updateNetworkHint();
+  renderNetwork();
+});
 
 // ==========================================
 // Initialize
 // ==========================================
-document.addEventListener('DOMContentLoaded', () => loadData());
+document.addEventListener('DOMContentLoaded', () => {
+  updateNetworkHint();
+  loadData();
+});

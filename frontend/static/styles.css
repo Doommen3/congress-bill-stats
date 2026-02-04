@@ -224,6 +224,14 @@ tbody tr:hover { background: #f8fafc; }
   color: #6b7280;
 }
 
+.network-controls select {
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  padding: 0.25rem 0.4rem;
+  background: #fff;
+  color: #111827;
+}
+
 .network-zoom-controls {
   display: flex;
   gap: 0.25rem;
