@@ -75,6 +75,40 @@
 
     <div id="status" class="muted mb"></div>
 
+    <!-- Party Comparison Stats -->
+    <section id="partyStats" class="party-stats mb">
+      <div class="stat-card dem">
+        <div class="stat-party">Democrats</div>
+        <div class="stat-row"><span class="stat-label">Avg Sponsored</span><span id="demSponsored" class="stat-value">—</span></div>
+        <div class="stat-row"><span class="stat-label">Avg Enacted</span><span id="demEnacted" class="stat-value">—</span></div>
+        <div class="stat-row"><span class="stat-label">Avg Success Rate</span><span id="demSuccessRate" class="stat-value">—</span></div>
+      </div>
+      <div class="stat-card rep">
+        <div class="stat-party">Republicans</div>
+        <div class="stat-row"><span class="stat-label">Avg Sponsored</span><span id="repSponsored" class="stat-value">—</span></div>
+        <div class="stat-row"><span class="stat-label">Avg Enacted</span><span id="repEnacted" class="stat-value">—</span></div>
+        <div class="stat-row"><span class="stat-label">Avg Success Rate</span><span id="repSuccessRate" class="stat-value">—</span></div>
+      </div>
+      <div class="stat-card overall">
+        <div class="stat-party">Overall</div>
+        <div class="stat-row"><span class="stat-label">Avg Sponsored</span><span id="allSponsored" class="stat-value">—</span></div>
+        <div class="stat-row"><span class="stat-label">Avg Enacted</span><span id="allEnacted" class="stat-value">—</span></div>
+        <div class="stat-row"><span class="stat-label">Avg Success Rate</span><span id="allSuccessRate" class="stat-value">—</span></div>
+      </div>
+    </section>
+
+    <!-- Leaderboards -->
+    <section id="leaderboards" class="leaderboards mb">
+      <div class="leaderboard-tabs">
+        <button class="lb-tab active" data-lb="sponsored">Most Bills Sponsored</button>
+        <button class="lb-tab" data-lb="enacted">Most Bills Enacted</button>
+        <button class="lb-tab" data-lb="success">Highest Success Rate</button>
+      </div>
+      <div class="leaderboard-content">
+        <ol id="leaderboardList" class="leaderboard-list"></ol>
+      </div>
+    </section>
+
     <div class="card">
       <!-- Congress Table -->
       <table id="dataTable">
@@ -90,6 +124,7 @@
             <th data-key="public_law_count" class="th-sort right">Public Laws</th>
             <th data-key="private_law_count" class="th-sort right">Private Laws</th>
             <th data-key="enacted_total" class="th-sort right">Total Laws</th>
+            <th data-key="success_rate" class="th-sort right">Success %</th>
           </tr>
         </thead>
         <tbody id="tbody"></tbody>
@@ -107,6 +142,7 @@
             <th data-key="chief_co_sponsor_total" class="th-sort il-sort right">Chief Co</th>
             <th data-key="co_sponsor_total" class="th-sort il-sort right">Co</th>
             <th data-key="enacted_total" class="th-sort il-sort right">Enacted</th>
+            <th data-key="success_rate" class="th-sort il-sort right">Success %</th>
           </tr>
         </thead>
         <tbody id="ilTbody"></tbody>

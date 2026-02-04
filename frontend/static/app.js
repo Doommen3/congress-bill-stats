@@ -44,10 +44,22 @@ const congressBtn = document.getElementById('congressBtn');
 const illinoisBtn = document.getElementById('illinoisBtn');
 
 // ==========================================
+// DOM Elements - Leaderboards & Stats
+// ==========================================
+const leaderboardList = document.getElementById('leaderboardList');
+const leaderboardTabs = document.querySelectorAll('.lb-tab');
+let currentLeaderboard = 'sponsored';
+
+// ==========================================
 // Utility Functions
 // ==========================================
 function fmt(n) { return new Intl.NumberFormat().format(n); }
 function setStatus(msg) { statusEl.textContent = msg || ''; }
+function calcSuccessRate(enacted, sponsored) {
+  if (!sponsored || sponsored === 0) return 0;
+  return (enacted / sponsored) * 100;
+}
+function fmtPct(n) { return n.toFixed(1) + '%'; }
 
 // ==========================================
 // Legislature Toggle
@@ -114,12 +126,19 @@ function renderCongress() {
   }
 
   rows.sort((a, b) => {
-    const va = sortKey === 'primary_sponsor_total'
-      ? (a.primary_sponsor_total ?? a.sponsored_total ?? 0)
-      : (a[sortKey] ?? '');
-    const vb = sortKey === 'primary_sponsor_total'
-      ? (b.primary_sponsor_total ?? b.sponsored_total ?? 0)
-      : (b[sortKey] ?? '');
+    let va, vb;
+    if (sortKey === 'primary_sponsor_total') {
+      va = a.primary_sponsor_total ?? a.sponsored_total ?? 0;
+      vb = b.primary_sponsor_total ?? b.sponsored_total ?? 0;
+    } else if (sortKey === 'success_rate') {
+      const aSpon = a.primary_sponsor_total ?? a.sponsored_total ?? 0;
+      const bSpon = b.primary_sponsor_total ?? b.sponsored_total ?? 0;
+      va = calcSuccessRate(a.enacted_total || 0, aSpon);
+      vb = calcSuccessRate(b.enacted_total || 0, bSpon);
+    } else {
+      va = a[sortKey] ?? '';
+      vb = b[sortKey] ?? '';
+    }
     if (typeof va === 'number' && typeof vb === 'number') {
       return sortDir === 'asc' ? va - vb : vb - va;
     }
@@ -130,20 +149,25 @@ function renderCongress() {
     return 0;
   });
 
-  tableBody.innerHTML = rows.map(r => `
+  tableBody.innerHTML = rows.map(r => {
+    const sponsored = r.primary_sponsor_total ?? r.sponsored_total ?? 0;
+    const enacted = r.enacted_total || 0;
+    const successRate = calcSuccessRate(enacted, sponsored);
+    return `
     <tr>
       <td>${r.sponsorName || '—'}</td>
       <td>${(r.chamber || '—').replace(/^\w/, c => c.toUpperCase())}</td>
       <td>${r.party || '—'}</td>
       <td>${r.state || '—'}</td>
-      <td class="right">${fmt(r.primary_sponsor_total ?? r.sponsored_total ?? 0)}</td>
+      <td class="right">${fmt(sponsored)}</td>
       <td class="right">${fmt(r.cosponsor_total || 0)}</td>
       <td class="right">${fmt(r.original_cosponsor_total || 0)}</td>
       <td class="right">${fmt(r.public_law_count || 0)}</td>
       <td class="right">${fmt(r.private_law_count || 0)}</td>
-      <td class="right">${fmt(r.enacted_total || 0)}</td>
+      <td class="right">${fmt(enacted)}</td>
+      <td class="right">${fmtPct(successRate)}</td>
     </tr>
-  `).join('');
+  `;}).join('');
 
   // Update summary
   if (currentSummary) {
@@ -176,8 +200,16 @@ function renderIllinois() {
   }
 
   rows.sort((a, b) => {
-    const va = a[sortKey] ?? '';
-    const vb = b[sortKey] ?? '';
+    let va, vb;
+    if (sortKey === 'success_rate') {
+      const aSpon = a.primary_sponsor_total ?? a.sponsored_total ?? 0;
+      const bSpon = b.primary_sponsor_total ?? b.sponsored_total ?? 0;
+      va = calcSuccessRate(a.enacted_total || 0, aSpon);
+      vb = calcSuccessRate(b.enacted_total || 0, bSpon);
+    } else {
+      va = a[sortKey] ?? '';
+      vb = b[sortKey] ?? '';
+    }
     if (typeof va === 'number' && typeof vb === 'number') {
       return sortDir === 'asc' ? va - vb : vb - va;
     }
@@ -188,18 +220,23 @@ function renderIllinois() {
     return 0;
   });
 
-  ilTableBody.innerHTML = rows.map(r => `
+  ilTableBody.innerHTML = rows.map(r => {
+    const sponsored = r.primary_sponsor_total ?? r.sponsored_total ?? 0;
+    const enacted = r.enacted_total || 0;
+    const successRate = calcSuccessRate(enacted, sponsored);
+    return `
     <tr>
       <td>${r.sponsorName || '—'}</td>
       <td>${(r.chamber || '—').replace(/^\w/, c => c.toUpperCase())}</td>
       <td>${r.party || '—'}</td>
       <td class="right">${r.district || '—'}</td>
-      <td class="right">${fmt(r.primary_sponsor_total ?? r.sponsored_total ?? 0)}</td>
+      <td class="right">${fmt(sponsored)}</td>
       <td class="right">${fmt(r.chief_co_sponsor_total || 0)}</td>
       <td class="right">${fmt(r.co_sponsor_total || 0)}</td>
-      <td class="right">${fmt(r.enacted_total || 0)}</td>
+      <td class="right">${fmt(enacted)}</td>
+      <td class="right">${fmtPct(successRate)}</td>
     </tr>
-  `).join('');
+  `;}).join('');
 
   // Update summary
   if (currentSummary) {
@@ -219,6 +256,110 @@ function render() {
   } else {
     renderIllinois();
   }
+  renderPartyStats();
+  renderLeaderboard();
+}
+
+// ==========================================
+// Party Stats
+// ==========================================
+function renderPartyStats() {
+  if (!currentData.length) {
+    document.getElementById('demSponsored').textContent = '—';
+    document.getElementById('demEnacted').textContent = '—';
+    document.getElementById('demSuccessRate').textContent = '—';
+    document.getElementById('repSponsored').textContent = '—';
+    document.getElementById('repEnacted').textContent = '—';
+    document.getElementById('repSuccessRate').textContent = '—';
+    document.getElementById('allSponsored').textContent = '—';
+    document.getElementById('allEnacted').textContent = '—';
+    document.getElementById('allSuccessRate').textContent = '—';
+    return;
+  }
+
+  const dems = currentData.filter(r => (r.party || '').toUpperCase() === 'D');
+  const reps = currentData.filter(r => (r.party || '').toUpperCase() === 'R');
+
+  const calcAvg = (arr, key) => {
+    if (!arr.length) return 0;
+    const sum = arr.reduce((acc, r) => acc + (r[key] ?? r.sponsored_total ?? 0), 0);
+    return sum / arr.length;
+  };
+
+  const calcAvgSuccess = (arr) => {
+    if (!arr.length) return 0;
+    const rates = arr.map(r => {
+      const sponsored = r.primary_sponsor_total ?? r.sponsored_total ?? 0;
+      const enacted = r.enacted_total || 0;
+      return calcSuccessRate(enacted, sponsored);
+    });
+    return rates.reduce((a, b) => a + b, 0) / rates.length;
+  };
+
+  // Democrats
+  document.getElementById('demSponsored').textContent = calcAvg(dems, 'primary_sponsor_total').toFixed(1);
+  document.getElementById('demEnacted').textContent = calcAvg(dems, 'enacted_total').toFixed(2);
+  document.getElementById('demSuccessRate').textContent = fmtPct(calcAvgSuccess(dems));
+
+  // Republicans
+  document.getElementById('repSponsored').textContent = calcAvg(reps, 'primary_sponsor_total').toFixed(1);
+  document.getElementById('repEnacted').textContent = calcAvg(reps, 'enacted_total').toFixed(2);
+  document.getElementById('repSuccessRate').textContent = fmtPct(calcAvgSuccess(reps));
+
+  // Overall
+  document.getElementById('allSponsored').textContent = calcAvg(currentData, 'primary_sponsor_total').toFixed(1);
+  document.getElementById('allEnacted').textContent = calcAvg(currentData, 'enacted_total').toFixed(2);
+  document.getElementById('allSuccessRate').textContent = fmtPct(calcAvgSuccess(currentData));
+}
+
+// ==========================================
+// Leaderboards
+// ==========================================
+function renderLeaderboard() {
+  if (!currentData.length) {
+    leaderboardList.innerHTML = '<li class="muted">No data loaded</li>';
+    return;
+  }
+
+  let sorted = [];
+  let valueFormatter = fmt;
+
+  if (currentLeaderboard === 'sponsored') {
+    sorted = [...currentData].sort((a, b) => {
+      const va = a.primary_sponsor_total ?? a.sponsored_total ?? 0;
+      const vb = b.primary_sponsor_total ?? b.sponsored_total ?? 0;
+      return vb - va;
+    });
+    valueFormatter = (r) => fmt(r.primary_sponsor_total ?? r.sponsored_total ?? 0) + ' bills';
+  } else if (currentLeaderboard === 'enacted') {
+    sorted = [...currentData].sort((a, b) => (b.enacted_total || 0) - (a.enacted_total || 0));
+    valueFormatter = (r) => fmt(r.enacted_total || 0) + ' laws';
+  } else if (currentLeaderboard === 'success') {
+    // Only include legislators with at least 5 sponsored bills for meaningful success rate
+    const minBills = 5;
+    sorted = currentData
+      .filter(r => (r.primary_sponsor_total ?? r.sponsored_total ?? 0) >= minBills)
+      .map(r => ({
+        ...r,
+        _successRate: calcSuccessRate(r.enacted_total || 0, r.primary_sponsor_total ?? r.sponsored_total ?? 0)
+      }))
+      .sort((a, b) => b._successRate - a._successRate);
+    valueFormatter = (r) => fmtPct(r._successRate);
+  }
+
+  const top10 = sorted.slice(0, 10);
+
+  leaderboardList.innerHTML = top10.map((r, i) => {
+    const partyClass = (r.party || '').toUpperCase() === 'D' ? 'dem' : ((r.party || '').toUpperCase() === 'R' ? 'rep' : '');
+    const location = currentLegislature === 'congress' ? (r.state || '') : ('District ' + (r.district || ''));
+    return `
+      <li>
+        <span class="lb-name">${r.sponsorName || 'Unknown'}</span>
+        <span class="lb-party ${partyClass}">(${r.party || '?'}-${location})</span>
+        <span class="lb-value">${valueFormatter(r)}</span>
+      </li>
+    `;
+  }).join('');
 }
 
 // ==========================================
@@ -300,19 +441,25 @@ function exportCongressCSV() {
     return;
   }
 
-  const csvHeaders = ['Legislator', 'Chamber', 'Party', 'State', 'Primary', 'Cosponsor', 'Original Cosponsor', 'Public Laws', 'Private Laws', 'Total Laws'];
-  const rows = currentData.map(r => [
-    r.sponsorName || '',
-    r.chamber || '',
-    r.party || '',
-    r.state || '',
-    r.primary_sponsor_total ?? r.sponsored_total ?? 0,
-    r.cosponsor_total || 0,
-    r.original_cosponsor_total || 0,
-    r.public_law_count || 0,
-    r.private_law_count || 0,
-    r.enacted_total || 0,
-  ]);
+  const csvHeaders = ['Legislator', 'Chamber', 'Party', 'State', 'Primary', 'Cosponsor', 'Original Cosponsor', 'Public Laws', 'Private Laws', 'Total Laws', 'Success Rate'];
+  const rows = currentData.map(r => {
+    const sponsored = r.primary_sponsor_total ?? r.sponsored_total ?? 0;
+    const enacted = r.enacted_total || 0;
+    const successRate = calcSuccessRate(enacted, sponsored);
+    return [
+      r.sponsorName || '',
+      r.chamber || '',
+      r.party || '',
+      r.state || '',
+      sponsored,
+      r.cosponsor_total || 0,
+      r.original_cosponsor_total || 0,
+      r.public_law_count || 0,
+      r.private_law_count || 0,
+      enacted,
+      fmtPct(successRate),
+    ];
+  });
 
   downloadCSV(csvHeaders, rows, `congress_${congressInput.value}_stats.csv`);
 }
@@ -323,17 +470,23 @@ function exportIllinoisCSV() {
     return;
   }
 
-  const csvHeaders = ['Legislator', 'Chamber', 'Party', 'District', 'Primary', 'Chief Co', 'Co', 'Enacted'];
-  const rows = currentData.map(r => [
-    r.sponsorName || '',
-    r.chamber || '',
-    r.party || '',
-    r.district || '',
-    r.primary_sponsor_total ?? r.sponsored_total ?? 0,
-    r.chief_co_sponsor_total || 0,
-    r.co_sponsor_total || 0,
-    r.enacted_total || 0,
-  ]);
+  const csvHeaders = ['Legislator', 'Chamber', 'Party', 'District', 'Primary', 'Chief Co', 'Co', 'Enacted', 'Success Rate'];
+  const rows = currentData.map(r => {
+    const sponsored = r.primary_sponsor_total ?? r.sponsored_total ?? 0;
+    const enacted = r.enacted_total || 0;
+    const successRate = calcSuccessRate(enacted, sponsored);
+    return [
+      r.sponsorName || '',
+      r.chamber || '',
+      r.party || '',
+      r.district || '',
+      sponsored,
+      r.chief_co_sponsor_total || 0,
+      r.co_sponsor_total || 0,
+      enacted,
+      fmtPct(successRate),
+    ];
+  });
 
   downloadCSV(csvHeaders, rows, `illinois_ga_${ilSessionSelect.value}_stats.csv`);
 }
@@ -391,7 +544,8 @@ function setupSortHandlers(headerElements, tableType) {
           'enacted_total',
           'public_law_count',
           'private_law_count',
-          'district'
+          'district',
+          'success_rate'
         ];
         sortDir = numericCols.includes(key) ? 'desc' : 'asc';
       }
@@ -421,6 +575,16 @@ ilLoadBtn.addEventListener('click', () => loadData());
 ilExportBtn.addEventListener('click', exportCSV);
 ilSearchBox.addEventListener('input', () => render());
 ilChamberFilter.addEventListener('change', () => render());
+
+// Leaderboard tabs
+leaderboardTabs.forEach(tab => {
+  tab.addEventListener('click', () => {
+    leaderboardTabs.forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    currentLeaderboard = tab.getAttribute('data-lb');
+    renderLeaderboard();
+  });
+});
 
 // ==========================================
 // Initialize
