@@ -57,6 +57,21 @@ def init_database():
             )
         """)
 
+        # Bill cosponsors table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bill_cosponsors (
+                bill_id TEXT NOT NULL,
+                congress INTEGER NOT NULL,
+                bioguide_id TEXT NOT NULL,
+                is_original INTEGER DEFAULT 0,
+                withdrawn INTEGER DEFAULT 0,
+                updated_at INTEGER,
+                PRIMARY KEY (bill_id, bioguide_id),
+                FOREIGN KEY (bill_id) REFERENCES bills(bill_id),
+                FOREIGN KEY (bioguide_id) REFERENCES legislators(bioguide_id)
+            )
+        """)
+
         # Laws table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS laws (
@@ -86,6 +101,8 @@ def init_database():
         # Create indexes for faster queries
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_bills_congress ON bills(congress)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_bills_sponsor ON bills(sponsor_bioguide_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_bill_cosponsors_congress ON bill_cosponsors(congress)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_bill_cosponsors_bioguide ON bill_cosponsors(bioguide_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_laws_congress ON laws(congress)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_laws_sponsor ON laws(sponsor_bioguide_id)")
 
@@ -168,6 +185,37 @@ def save_bills_batch(congress: int, bills: List[Dict[str, Any]]):
         """, data)
         conn.commit()
         print(f"[db] Saved {len(data)} bills for Congress {congress}", flush=True)
+
+
+def save_bill_cosponsors_batch(congress: int, cosponsors: List[Dict[str, Any]]):
+    """Save multiple bill cosponsor records in a single transaction."""
+    if not cosponsors:
+        return
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        now = int(time.time())
+        data = []
+        for c in cosponsors:
+            bill_id = c.get("bill_id")
+            bioguide_id = c.get("bioguide_id")
+            if not bill_id or not bioguide_id:
+                continue
+            data.append((
+                bill_id,
+                congress,
+                bioguide_id,
+                1 if c.get("is_original") else 0,
+                1 if c.get("withdrawn") else 0,
+                now,
+            ))
+
+        cursor.executemany("""
+            INSERT OR REPLACE INTO bill_cosponsors
+            (bill_id, congress, bioguide_id, is_original, withdrawn, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, data)
+        conn.commit()
+        print(f"[db] Saved {len(data)} bill cosponsors for Congress {congress}", flush=True)
 
 
 def save_law(congress: int, law_type: str, law_number: str, bill_id: str,
@@ -288,16 +336,19 @@ def get_stats_from_db(congress: int) -> Optional[Dict[str, Any]]:
                 l.state,
                 l.chamber,
                 COUNT(DISTINCT b.bill_id) as sponsored_total,
+                COUNT(DISTINCT CASE WHEN bc.withdrawn = 0 THEN bc.bill_id END) as cosponsor_total,
+                COUNT(DISTINCT CASE WHEN bc.withdrawn = 0 AND bc.is_original = 1 THEN bc.bill_id END) as original_cosponsor_total,
                 COUNT(DISTINCT CASE WHEN law.law_type = 'public' THEN law.law_id END) as public_law_count,
                 COUNT(DISTINCT CASE WHEN law.law_type = 'private' THEN law.law_id END) as private_law_count,
                 COUNT(DISTINCT law.law_id) as enacted_total
             FROM legislators l
             LEFT JOIN bills b ON l.bioguide_id = b.sponsor_bioguide_id AND b.congress = ?
+            LEFT JOIN bill_cosponsors bc ON l.bioguide_id = bc.bioguide_id AND bc.congress = ?
             LEFT JOIN laws law ON b.bill_id = law.bill_id AND law.congress = ?
             GROUP BY l.bioguide_id
-            HAVING sponsored_total > 0
+            HAVING sponsored_total > 0 OR cosponsor_total > 0 OR original_cosponsor_total > 0
             ORDER BY sponsored_total DESC, sponsor_name ASC
-        """, (congress, congress))
+        """, (congress, congress, congress))
 
         rows = []
         for row in cursor.fetchall():
@@ -308,6 +359,9 @@ def get_stats_from_db(congress: int) -> Optional[Dict[str, Any]]:
                 "state": row["state"],
                 "chamber": row["chamber"],
                 "sponsored_total": row["sponsored_total"],
+                "primary_sponsor_total": row["sponsored_total"],
+                "cosponsor_total": row["cosponsor_total"],
+                "original_cosponsor_total": row["original_cosponsor_total"],
                 "public_law_count": row["public_law_count"],
                 "private_law_count": row["private_law_count"],
                 "enacted_total": row["enacted_total"],
@@ -349,6 +403,7 @@ def clear_congress_data(congress: int):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM laws WHERE congress = ?", (congress,))
+        cursor.execute("DELETE FROM bill_cosponsors WHERE congress = ?", (congress,))
         cursor.execute("DELETE FROM bills WHERE congress = ?", (congress,))
         cursor.execute("DELETE FROM cache_metadata WHERE congress = ?", (congress,))
         conn.commit()

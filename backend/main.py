@@ -1,4 +1,5 @@
 import os
+import ipaddress
 import time
 import json
 from typing import Dict, Any, List, Optional, Tuple
@@ -6,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from requests.exceptions import Timeout, RequestException, ConnectionError as ReqConnErr
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -32,6 +33,7 @@ CACHE_DIR = os.environ.get("CACHE_DIR", "./cache")
 DEFAULT_CONGRESS = int(os.environ.get("DEFAULT_CONGRESS", "119"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))  # parallel page fetchers
 DETAIL_WORKERS = int(os.environ.get("DETAIL_WORKERS", "8"))  # parallel item fetchers
+COSPONSOR_WORKERS = int(os.environ.get("COSPONSOR_WORKERS", "6"))  # parallel cosponsor fetchers
 DEFAULT_IL_SESSION = int(os.environ.get("DEFAULT_IL_SESSION", "104"))  # Illinois GA session
 
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -70,6 +72,49 @@ app.mount(
 # -------------------------------
 def cache_path(congress: int) -> str:
     return os.path.join(CACHE_DIR, f"stats_{congress}.json")
+
+
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    if request.client:
+        return request.client.host
+    return ""
+
+
+def _parse_admin_allowlist() -> List[ipaddress._BaseNetwork]:
+    raw = os.environ.get("ADMIN_IP_ALLOWLIST", "")
+    entries = [e.strip() for e in raw.split(",") if e.strip()]
+    networks: List[ipaddress._BaseNetwork] = []
+    for entry in entries:
+        try:
+            if "/" in entry:
+                networks.append(ipaddress.ip_network(entry, strict=False))
+            else:
+                ip_obj = ipaddress.ip_address(entry)
+                suffix = "/32" if ip_obj.version == 4 else "/128"
+                networks.append(ipaddress.ip_network(f"{entry}{suffix}", strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+def _is_admin_request(request: Request) -> bool:
+    networks = _parse_admin_allowlist()
+    if not networks:
+        return False
+    ip_str = _get_client_ip(request)
+    if not ip_str:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(ip_obj in net for net in networks)
 
 def load_cache(congress: int) -> Optional[Dict[str, Any]]:
     """Load cached stats from file or database."""
@@ -318,6 +363,182 @@ def fetch_primary_sponsor_from_item(congress: int, b: Dict[str, Any]) -> Optiona
 
 
 # -------------------------------
+# Cosponsor extraction helpers
+# -------------------------------
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "t", "yes", "y", "1")
+    return False
+
+
+def _is_withdrawn_cosponsor(c: Dict[str, Any]) -> bool:
+    if c.get("withdrawnDate") or c.get("withdrawalDate"):
+        return True
+    return _boolish(c.get("withdrawn") or c.get("isWithdrawn"))
+
+
+def _is_original_cosponsor(c: Dict[str, Any]) -> bool:
+    return _boolish(
+        c.get("isOriginalCosponsor") or c.get("originalCosponsor") or c.get("isOriginal")
+    )
+
+
+def _extract_cosponsor_items(obj: Any) -> Optional[List[Dict[str, Any]]]:
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        items = obj.get("item")
+        if isinstance(items, list):
+            return items
+        items = obj.get("cosponsors")
+        if isinstance(items, list):
+            return items
+    return None
+
+
+def _cosponsor_count_hint(obj: Any) -> Optional[int]:
+    if isinstance(obj, dict):
+        for key in ("count", "totalCount", "total", "countAll"):
+            if key in obj:
+                try:
+                    return int(obj.get(key) or 0)
+                except (TypeError, ValueError):
+                    return None
+        items = obj.get("item")
+        if isinstance(items, list):
+            return len(items)
+    if isinstance(obj, list):
+        return len(obj)
+    return None
+
+
+def _extract_cosponsors(j: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract cosponsor items from API response, handling various shapes."""
+    if isinstance(j.get("cosponsors"), list):
+        return j["cosponsors"]
+    data = j.get("data")
+    if isinstance(data, dict) and isinstance(data.get("cosponsors"), list):
+        return data["cosponsors"]
+    if isinstance(j.get("cosponsors"), dict):
+        items = j["cosponsors"].get("item")
+        if isinstance(items, list):
+            return items
+    if isinstance(data, dict) and isinstance(data.get("cosponsors"), dict):
+        items = data["cosponsors"].get("item")
+        if isinstance(items, list):
+            return items
+    return []
+
+
+def _normalize_cosponsor_item(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    bioguide = item.get("bioguideId") or item.get("bioguideID") or item.get("bioguide")
+    if not bioguide:
+        return None
+    return {
+        "bioguideId": bioguide,
+        "fullName": item.get("fullName") or item.get("name"),
+        "party": item.get("party"),
+        "state": item.get("state"),
+        "chamber": item.get("chamber"),
+        "is_original": _is_original_cosponsor(item),
+        "withdrawn": _is_withdrawn_cosponsor(item),
+    }
+
+
+def fetch_cosponsors_for_bill(congress: int, b: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Fetch cosponsors for a bill using /bill/{congress}/{type}/{number}/cosponsors.
+    Returns a list of normalized cosponsor dicts.
+    """
+    # Use any list-level cosponsors if fully present
+    cosponsor_obj = b.get("cosponsors")
+    inline_items = _extract_cosponsor_items(cosponsor_obj)
+    if inline_items is not None and inline_items:
+        out = []
+        for item in inline_items:
+            normalized = _normalize_cosponsor_item(item or {})
+            if normalized:
+                out.append(normalized)
+        if out:
+            return out
+
+    # If we have a clear count of zero, skip the API call
+    if _cosponsor_count_hint(cosponsor_obj) == 0:
+        return []
+
+    path = _bill_identity(congress, b)
+    if not path:
+        return []
+
+    limit = 250
+    first = api_get(f"{path}/cosponsors", params={"limit": limit, "offset": 0})
+    items = _extract_cosponsors(first)
+    out: List[Dict[str, Any]] = []
+    for item in items:
+        normalized = _normalize_cosponsor_item(item or {})
+        if normalized:
+            out.append(normalized)
+
+    pagination = first.get("pagination") or {}
+    total = int(pagination.get("count") or len(items))
+    if total > limit:
+        for off in range(limit, total, limit):
+            resp = api_get(f"{path}/cosponsors", params={"limit": limit, "offset": off})
+            page_items = _extract_cosponsors(resp)
+            for item in page_items:
+                normalized = _normalize_cosponsor_item(item or {})
+                if normalized:
+                    out.append(normalized)
+
+    return out
+
+
+def _apply_cosponsors_to_totals(
+    cosponsors: List[Dict[str, Any]],
+    by_sponsor: Dict[str, Dict[str, Any]],
+    bill_chamber: Optional[str] = None,
+    primary_bioguide: Optional[str] = None,
+) -> None:
+    """Apply current cosponsor counts to the by_sponsor aggregation."""
+    seen: set = set()
+    for c in cosponsors or []:
+        if c.get("withdrawn"):
+            continue
+        bioguide = c.get("bioguideId")
+        if not bioguide or bioguide == primary_bioguide:
+            continue
+        if bioguide in seen:
+            continue
+        seen.add(bioguide)
+
+        rec = by_sponsor.get(bioguide)
+        if rec is None:
+            rec = {
+                "bioguideId": bioguide,
+                "sponsorName": c.get("fullName"),
+                "party": c.get("party"),
+                "state": c.get("state"),
+                "chamber": c.get("chamber") or bill_chamber,
+                "sponsored_total": 0,
+                "primary_sponsor_total": 0,
+                "cosponsor_total": 0,
+                "original_cosponsor_total": 0,
+                "enacted_total": 0,
+                "public_law_count": 0,
+                "private_law_count": 0,
+            }
+            by_sponsor[bioguide] = rec
+
+        rec["cosponsor_total"] += 1
+        if c.get("is_original"):
+            rec["original_cosponsor_total"] += 1
+
+
+# -------------------------------
 # Member lookup (unchanged, but resilient to shape)
 # -------------------------------
 def fetch_member_snapshot(bioguide_id: str) -> Dict[str, Any]:
@@ -512,10 +733,46 @@ def build_stats(congress: int) -> Dict[str, Any]:
     # Combine all bill-sponsor pairs
     pairs = list_level + item_results
 
+    # Step 3b: Fetch cosponsors for each bill
+    cosponsors_by_bill: Dict[str, List[Dict[str, Any]]] = {}
+    cosponsor_records: List[Dict[str, Any]] = []
+    bill_by_key: Dict[str, Dict[str, Any]] = {}
+
+    if raw_bills:
+        with ThreadPoolExecutor(max_workers=COSPONSOR_WORKERS) as pool:
+            futs = {pool.submit(fetch_cosponsors_for_bill, congress, b): b for b in raw_bills}
+            done = 0
+            for fut in as_completed(futs):
+                b = futs[fut]
+                try:
+                    cosponsors = fut.result() or []
+                except Exception:
+                    cosponsors = []
+                bill_type = (b.get("type") or "").lower()
+                bill_number = b.get("number")
+                bill_key = normalize_bill_key(congress, bill_type, bill_number) if bill_type and bill_number else None
+                if bill_key:
+                    cosponsors_by_bill[bill_key] = cosponsors
+                    bill_by_key[bill_key] = b
+                    for c in cosponsors:
+                        bioguide = c.get("bioguideId")
+                        if not bioguide:
+                            continue
+                        cosponsor_records.append({
+                            "bill_id": bill_key,
+                            "bioguide_id": bioguide,
+                            "is_original": bool(c.get("is_original")),
+                            "withdrawn": bool(c.get("withdrawn")),
+                        })
+                done += 1
+                if done % 200 == 0 or done == len(raw_bills):
+                    print(f"[cosponsors] fetched {done}/{len(raw_bills)} bills", flush=True)
+
     # Step 4: Tally by sponsor using the law lookup
     by_sponsor: Dict[str, Dict[str, Any]] = {}
     missing_sponsor = 0
     laws_matched = 0
+    processed_bill_keys: set = set()
 
     for b, sponsor_info in pairs:
         if not sponsor_info:
@@ -541,6 +798,9 @@ def build_stats(congress: int) -> Dict[str, Any]:
                 "state": sponsor_info.get("state"),
                 "chamber": sponsor_info.get("chamber"),
                 "sponsored_total": 0,
+                "primary_sponsor_total": 0,
+                "cosponsor_total": 0,
+                "original_cosponsor_total": 0,
                 "enacted_total": 0,
                 "public_law_count": 0,
                 "private_law_count": 0,
@@ -548,6 +808,7 @@ def build_stats(congress: int) -> Dict[str, Any]:
             by_sponsor[bioguide] = rec
 
         rec["sponsored_total"] += 1
+        rec["primary_sponsor_total"] += 1
 
         if law_info:
             laws_matched += 1
@@ -556,6 +817,29 @@ def build_stats(congress: int) -> Dict[str, Any]:
                 rec["public_law_count"] += 1
             else:
                 rec["private_law_count"] += 1
+
+        if bill_key:
+            processed_bill_keys.add(bill_key)
+            cosponsors = cosponsors_by_bill.get(bill_key, [])
+            if cosponsors:
+                _apply_cosponsors_to_totals(
+                    cosponsors,
+                    by_sponsor,
+                    bill_chamber=b.get("originChamber") or sponsor_info.get("chamber"),
+                    primary_bioguide=bioguide,
+                )
+
+    # Apply cosponsors for bills without a primary sponsor
+    for bill_key, cosponsors in cosponsors_by_bill.items():
+        if bill_key in processed_bill_keys:
+            continue
+        bill = bill_by_key.get(bill_key) or {}
+        _apply_cosponsors_to_totals(
+            cosponsors,
+            by_sponsor,
+            bill_chamber=bill.get("originChamber"),
+            primary_bioguide=None,
+        )
 
     # Step 5: Enrich any missing metadata from the member endpoint
     needs_enrichment = [
@@ -618,6 +902,10 @@ def build_stats(congress: int) -> Dict[str, Any]:
                 b["_sponsor_info"] = sponsor_info
                 bills_with_sponsors.append(b)
         db.save_bills_batch(congress, bills_with_sponsors)
+
+        # Save bill cosponsors
+        if cosponsor_records:
+            db.save_bill_cosponsors_batch(congress, cosponsor_records)
 
         # Save laws with sponsor info
         for law in laws:
@@ -683,6 +971,7 @@ def api_stats(
     refresh: bool = Query(False, description="Force rebuild and refresh cache."),
     background: bool = Query(False, description="Run refresh in background, return cached data immediately."),
     background_tasks: BackgroundTasks = None,
+    request: Request = None,
 ):
     """
     Get legislator statistics for a Congress.
@@ -693,10 +982,15 @@ def api_stats(
     """
     print(f"[api_stats] start congress={congress} refresh={refresh} background={background}", flush=True)
 
+    is_admin = _is_admin_request(request) if request else False
+
     cached = load_cache(congress)
 
     # If background refresh requested and we have cached data
     if refresh and background and cached and background_tasks:
+        if not is_admin:
+            cached["_refresh_status"] = "blocked"
+            return JSONResponse(cached)
         # Check if already refreshing
         status = _refresh_status.get(congress, {})
         if status.get("status") != "running":
@@ -711,7 +1005,16 @@ def api_stats(
     if not refresh and cached:
         return JSONResponse(cached)
 
-    # Synchronous refresh
+    if refresh and not is_admin:
+        if cached:
+            return JSONResponse(cached)
+        raise HTTPException(status_code=403, detail="Refresh is restricted to admin.")
+
+    # Block cold builds for non-admins
+    if not cached and not is_admin:
+        raise HTTPException(status_code=503, detail="Cache not ready. Admin must refresh.")
+
+    # Synchronous refresh (admin-only or cache miss for admin)
     stats = build_stats(congress)
     save_cache(congress, stats)
     return JSONResponse(stats)
@@ -733,6 +1036,7 @@ def api_il_stats(
     refresh: bool = Query(False, description="Force rebuild and refresh cache."),
     background: bool = Query(False, description="Run refresh in background, return cached data immediately."),
     background_tasks: BackgroundTasks = None,
+    request: Request = None,
 ):
     """
     Get Illinois legislator statistics for a General Assembly session.
@@ -743,10 +1047,15 @@ def api_il_stats(
     """
     print(f"[api_il_stats] start session={session} refresh={refresh} background={background}", flush=True)
 
+    is_admin = _is_admin_request(request) if request else False
+
     cached = il_stats.load_il_cache(session)
 
     # If background refresh requested and we have cached data
     if refresh and background and cached and background_tasks:
+        if not is_admin:
+            cached["_refresh_status"] = "blocked"
+            return JSONResponse(cached)
         # Check if already refreshing
         status = il_stats.get_il_refresh_status(session)
         if status.get("status") != "running":
@@ -761,7 +1070,16 @@ def api_il_stats(
     if not refresh and cached:
         return JSONResponse(cached)
 
-    # Synchronous refresh
+    if refresh and not is_admin:
+        if cached:
+            return JSONResponse(cached)
+        raise HTTPException(status_code=403, detail="Refresh is restricted to admin.")
+
+    # Block cold builds for non-admins
+    if not cached and not is_admin:
+        raise HTTPException(status_code=503, detail="Cache not ready. Admin must refresh.")
+
+    # Synchronous refresh (admin-only or cache miss for admin)
     stats = il_stats.build_il_stats(session)
     il_stats.save_il_cache(session, stats)
     return JSONResponse(stats)

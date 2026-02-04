@@ -77,7 +77,7 @@ function switchLegislature(legislature) {
   }
 
   // Reset sort
-  sortKey = legislature === 'illinois' ? 'primary_sponsor_total' : 'sponsored_total';
+  sortKey = legislature === 'congress' ? 'primary_sponsor_total' : 'primary_sponsor_total';
   sortDir = 'desc';
 
   // Clear current display
@@ -136,7 +136,9 @@ function renderCongress() {
       <td>${(r.chamber || '—').replace(/^\w/, c => c.toUpperCase())}</td>
       <td>${r.party || '—'}</td>
       <td>${r.state || '—'}</td>
-      <td class="right">${fmt(r.sponsored_total || 0)}</td>
+      <td class="right">${fmt(r.primary_sponsor_total ?? r.sponsored_total ?? 0)}</td>
+      <td class="right">${fmt(r.cosponsor_total || 0)}</td>
+      <td class="right">${fmt(r.original_cosponsor_total || 0)}</td>
       <td class="right">${fmt(r.public_law_count || 0)}</td>
       <td class="right">${fmt(r.private_law_count || 0)}</td>
       <td class="right">${fmt(r.enacted_total || 0)}</td>
@@ -247,7 +249,7 @@ async function loadCongressData(forceRefresh = false) {
     setStatus('Network error: ' + (e && e.message ? e.message : e));
   } finally {
     loadBtn.disabled = false;
-    loadBtn.textContent = 'Load / Refresh';
+  loadBtn.textContent = 'Load';
   }
 }
 
@@ -277,7 +279,7 @@ async function loadIllinoisData(forceRefresh = false) {
     setStatus('Network error: ' + (e && e.message ? e.message : e));
   } finally {
     ilLoadBtn.disabled = false;
-    ilLoadBtn.textContent = 'Load / Refresh';
+  ilLoadBtn.textContent = 'Load';
   }
 }
 
@@ -298,13 +300,15 @@ function exportCongressCSV() {
     return;
   }
 
-  const csvHeaders = ['Legislator', 'Chamber', 'Party', 'State', 'Sponsored', 'Public Laws', 'Private Laws', 'Total Laws'];
+  const csvHeaders = ['Legislator', 'Chamber', 'Party', 'State', 'Primary', 'Cosponsor', 'Original Cosponsor', 'Public Laws', 'Private Laws', 'Total Laws'];
   const rows = currentData.map(r => [
     r.sponsorName || '',
     r.chamber || '',
     r.party || '',
     r.state || '',
-    r.sponsored_total || 0,
+    r.primary_sponsor_total ?? r.sponsored_total ?? 0,
+    r.cosponsor_total || 0,
+    r.original_cosponsor_total || 0,
     r.public_law_count || 0,
     r.private_law_count || 0,
     r.enacted_total || 0,
@@ -380,6 +384,8 @@ function setupSortHandlers(headerElements, tableType) {
         const numericCols = [
           'sponsored_total',
           'primary_sponsor_total',
+          'cosponsor_total',
+          'original_cosponsor_total',
           'chief_co_sponsor_total',
           'co_sponsor_total',
           'enacted_total',

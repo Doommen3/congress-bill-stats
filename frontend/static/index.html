@@ -41,7 +41,7 @@
         <input id="searchBox" type="text" placeholder="e.g., Smith or IL">
       </div>
       <div class="control buttons">
-        <button id="loadBtn" class="btn">Load / Refresh</button>
+        <button id="loadBtn" class="btn">Load</button>
         <button id="exportBtn" class="btn secondary">Export CSV</button>
       </div>
     </section>
@@ -68,7 +68,7 @@
         <input id="ilSearchBox" type="text" placeholder="e.g., Smith or 5">
       </div>
       <div class="control buttons">
-        <button id="ilLoadBtn" class="btn">Load / Refresh</button>
+        <button id="ilLoadBtn" class="btn">Load</button>
         <button id="ilExportBtn" class="btn secondary">Export CSV</button>
       </div>
     </section>
@@ -84,7 +84,9 @@
             <th data-key="chamber" class="th-sort">Chamber</th>
             <th data-key="party" class="th-sort">Party</th>
             <th data-key="state" class="th-sort">State</th>
-            <th data-key="sponsored_total" class="th-sort right">Sponsored</th>
+            <th data-key="primary_sponsor_total" class="th-sort right">Primary</th>
+            <th data-key="cosponsor_total" class="th-sort right">Cosponsor</th>
+            <th data-key="original_cosponsor_total" class="th-sort right">Original Cosponsor</th>
             <th data-key="public_law_count" class="th-sort right">Public Laws</th>
             <th data-key="private_law_count" class="th-sort right">Private Laws</th>
             <th data-key="enacted_total" class="th-sort right">Total Laws</th>

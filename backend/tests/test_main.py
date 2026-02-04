@@ -285,6 +285,7 @@ class TestDatabase:
 
         assert "legislators" in tables
         assert "bills" in tables
+        assert "bill_cosponsors" in tables
         assert "laws" in tables
         assert "cache_metadata" in tables
 
@@ -372,6 +373,55 @@ class TestAPIEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["congress"] == 119
+
+    @patch("main.build_stats")
+    @patch("main.load_cache")
+    def test_stats_refresh_blocked_for_non_admin(self, mock_cache, mock_build, client, monkeypatch):
+        """Non-admin refresh should not trigger rebuild when cache exists."""
+        monkeypatch.setenv("ADMIN_IP_ALLOWLIST", "10.0.0.1")
+        mock_cache.return_value = {
+            "congress": 119,
+            "generated_at": 1234567890,
+            "rows": [],
+            "summary": {},
+        }
+        response = client.get(
+            "/api/stats?congress=119&refresh=true",
+            headers={"x-forwarded-for": "1.2.3.4"},
+        )
+        assert response.status_code == 200
+        mock_build.assert_not_called()
+
+    @patch("main.build_stats")
+    @patch("main.load_cache")
+    def test_stats_refresh_allowed_for_admin(self, mock_cache, mock_build, client, monkeypatch):
+        """Admin refresh should trigger rebuild."""
+        monkeypatch.setenv("ADMIN_IP_ALLOWLIST", "1.2.3.4")
+        mock_cache.return_value = {
+            "congress": 119,
+            "generated_at": 1234567890,
+            "rows": [],
+            "summary": {},
+        }
+        mock_build.return_value = mock_cache.return_value
+
+        response = client.get(
+            "/api/stats?congress=119&refresh=true",
+            headers={"x-forwarded-for": "1.2.3.4"},
+        )
+        assert response.status_code == 200
+        mock_build.assert_called_once()
+
+    @patch("main.load_cache")
+    def test_stats_cold_build_blocked_for_non_admin(self, mock_cache, client, monkeypatch):
+        """Non-admin should not trigger cold build when no cache exists."""
+        monkeypatch.setenv("ADMIN_IP_ALLOWLIST", "10.0.0.1")
+        mock_cache.return_value = None
+        response = client.get(
+            "/api/stats?congress=119",
+            headers={"x-forwarded-for": "1.2.3.4"},
+        )
+        assert response.status_code == 503
 
 
 class TestLawEndpointIntegration:
