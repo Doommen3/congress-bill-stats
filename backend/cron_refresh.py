@@ -4,8 +4,8 @@ Intended to be run by a scheduler (e.g., Render cron job).
 """
 import os
 
-from main import build_stats, save_cache, DEFAULT_CONGRESS
-from illinois_stats import build_il_stats, save_il_cache, DEFAULT_IL_SESSION
+from main import build_stats, save_cache, DEFAULT_CONGRESS, DEFAULT_IL_SESSION
+from illinois_stats import build_il_stats, save_il_cache
 
 
 def _parse_int_list(value: str) -> list[int]:
@@ -28,8 +28,14 @@ def main() -> None:
     if not il_list:
         il_list = [DEFAULT_IL_SESSION]
 
+    api_key = (
+        os.environ.get("CRON_CONGRESS_API_KEY")
+        or os.environ.get("ADMIN_CONGRESS_API_KEY")
+        or os.environ.get("CONGRESS_API_KEY")
+    )
+
     for congress in congress_list:
-        stats = build_stats(congress)
+        stats = build_stats(congress, api_key=api_key)
         save_cache(congress, stats)
 
     for session in il_list:

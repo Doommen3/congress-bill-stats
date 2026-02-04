@@ -125,7 +125,7 @@ class TestCosponsorAggregation:
             ],
         }
 
-        def cosponsor_side_effect(congress, bill):
+        def cosponsor_side_effect(congress, bill, api_key=None):
             key = f"{congress}-{bill.get('type')}-{bill.get('number')}"
             return cosponsor_map.get(key, [])
 
