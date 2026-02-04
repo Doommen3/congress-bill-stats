@@ -126,8 +126,12 @@ def il_http_get(url: str, timeout: Tuple[int, int] = (15, 45)) -> requests.Respo
 def il_fetch_xml(url: str) -> str:
     """Fetch XML content from URL, stripping BOM if present."""
     resp = il_http_get(url)
-    # Use response.content (bytes) and decode with utf-8-sig to handle BOM
-    content = resp.content.decode('utf-8-sig')
+    # Try UTF-8 first, fall back to Latin-1 for files with accented characters
+    try:
+        content = resp.content.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        # Some ILGA files contain Latin-1 encoded characters (e.g., accented names)
+        content = resp.content.decode('latin-1')
     return content
 
 
