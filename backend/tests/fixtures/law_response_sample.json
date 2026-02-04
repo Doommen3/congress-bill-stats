@@ -1,0 +1,4 @@
+{
+  "_placeholder": true,
+  "note": "Paste the JSON response from /law/{congress}/pub or /law/{congress}/priv here to validate _extract_laws()."
+}

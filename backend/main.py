@@ -349,9 +349,13 @@ def fetch_member_snapshot(bioguide_id: str) -> Dict[str, Any]:
 def _extract_laws(j: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Extract law items from API response, handling various shapes."""
     # Try common response shapes
+    if isinstance(j.get("bills"), list):
+        return j["bills"]
     if isinstance(j.get("laws"), list):
         return j["laws"]
     data = j.get("data")
+    if isinstance(data, dict) and isinstance(data.get("bills"), list):
+        return data["bills"]
     if isinstance(data, dict) and isinstance(data.get("laws"), list):
         return data["laws"]
     if isinstance(data, list):
