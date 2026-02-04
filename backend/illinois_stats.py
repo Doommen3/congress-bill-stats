@@ -192,6 +192,116 @@ def _parse_action_date(date_str: str) -> Optional[datetime]:
         return None
 
 
+def _calculate_days_between(start_date_str: str, end_date_str: str) -> Optional[int]:
+    """Calculate days between two date strings in M/D/YYYY format."""
+    start = _parse_action_date(start_date_str)
+    end = _parse_action_date(end_date_str)
+    if start and end:
+        delta = end - start
+        return max(0, delta.days)  # Ensure non-negative
+    return None
+
+
+def _create_member_stats_record(member: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a new member stats record with all fields initialized."""
+    return {
+        "memberId": member["member_id"],
+        "sponsorName": member["name"],
+        "party": member["party"],
+        "chamber": member["chamber"],
+        "district": member["district"],
+        "sponsored_total": 0,
+        "primary_sponsor_total": 0,
+        "chief_co_sponsor_total": 0,
+        "co_sponsor_total": 0,
+        "enacted_total": 0,
+        "public_act_numbers": [],
+        # New fields for velocity and bipartisan score
+        "_velocity_days": [],  # List of days to enactment for averaging
+        "_cross_party_cosponsors": 0,  # Count of cross-party co-sponsorships
+        "_total_cosponsored_bills": 0,  # Total bills they co-sponsored
+    }
+
+
+def _calculate_advanced_metrics(
+    by_member: Dict[str, Dict[str, Any]],
+    all_bills: List[Dict[str, Any]],
+    all_members: List[Dict[str, Any]],
+    matcher: "ILNameMatcher"
+) -> None:
+    """
+    Calculate advanced metrics for each legislator:
+    - avg_days_to_enactment: Average days from filing to enactment for enacted bills
+    - bipartisan_score: Percentage of co-sponsored bills from opposite party
+    """
+    # Build member party lookup
+    member_party = {m["member_id"]: m.get("party", "").upper() for m in all_members}
+
+    # Track velocity and bipartisan data for each member
+    velocity_data: Dict[str, List[int]] = {}  # member_id -> list of days
+    bipartisan_data: Dict[str, Dict[str, int]] = {}  # member_id -> {"cross": n, "total": n}
+
+    for bill in all_bills:
+        sponsor_id = bill.get("sponsor_member_id")
+        if not sponsor_id:
+            continue
+
+        sponsor_party = member_party.get(sponsor_id, "")
+
+        # Calculate velocity for enacted bills
+        if bill.get("public_act_number"):
+            filing_date = bill.get("filing_date")
+            enactment_date = bill.get("enactment_date")
+            if filing_date and enactment_date:
+                days = _calculate_days_between(filing_date, enactment_date)
+                if days is not None:
+                    if sponsor_id not in velocity_data:
+                        velocity_data[sponsor_id] = []
+                    velocity_data[sponsor_id].append(days)
+
+        # Calculate bipartisan score based on co-sponsor relationships
+        # For each co-sponsor, check if they're from a different party than the sponsor
+        bill_type = bill.get("bill_type", "").lower()
+        fallback_chamber = "house" if bill_type in ("hb", "hr", "hjr", "hjrca") else "senate"
+
+        for cosponsor_type in ["chief_co_sponsors", "co_sponsors"]:
+            cosponsors = _coerce_json_list(bill.get(cosponsor_type))
+            for name in cosponsors:
+                chamber_hint = _infer_chamber_from_name(name) or fallback_chamber
+                cosponsor_member = matcher.match(name, chamber_hint)
+                if not cosponsor_member:
+                    continue
+
+                cosponsor_id = cosponsor_member["member_id"]
+                cosponsor_party = member_party.get(cosponsor_id, "")
+
+                # Initialize bipartisan tracking for this co-sponsor
+                if cosponsor_id not in bipartisan_data:
+                    bipartisan_data[cosponsor_id] = {"cross": 0, "total": 0}
+
+                bipartisan_data[cosponsor_id]["total"] += 1
+
+                # Check if cross-party (both have valid parties and they differ)
+                if sponsor_party and cosponsor_party and sponsor_party != cosponsor_party:
+                    bipartisan_data[cosponsor_id]["cross"] += 1
+
+    # Apply calculated metrics to each member
+    for member_id, record in by_member.items():
+        # Velocity
+        if member_id in velocity_data and velocity_data[member_id]:
+            days_list = velocity_data[member_id]
+            record["avg_days_to_enactment"] = round(sum(days_list) / len(days_list), 1)
+        else:
+            record["avg_days_to_enactment"] = None
+
+        # Bipartisan score
+        if member_id in bipartisan_data and bipartisan_data[member_id]["total"] > 0:
+            bp = bipartisan_data[member_id]
+            record["bipartisan_score"] = round((bp["cross"] / bp["total"]) * 100, 1)
+        else:
+            record["bipartisan_score"] = None
+
+
 def _normalize_action_text(text: str) -> str:
     """Normalize action text for matching."""
     return ' '.join((text or "").split())
@@ -631,6 +741,8 @@ def parse_bill_xml(xml_content: str, filename: str, ga_session: int) -> Optional
     public_act_number = None
     latest_action_text = None
     latest_action_date = None
+    filing_date = None
+    enactment_date = None
 
     actions = _parse_actions(root)
     if actions:
@@ -638,10 +750,16 @@ def parse_bill_xml(xml_content: str, filename: str, ga_session: int) -> Optional
             action_text = action.get("text") or ""
             action_date = action.get("date") or ""
 
+            # Track filing date (first Filed/Prefiled action)
+            if filing_date is None and action_date:
+                if re.search(r'\b(Filed|Prefiled)\b', action_text, re.IGNORECASE):
+                    filing_date = action_date
+
             # Check for Public Act
             pa_match = PUBLIC_ACT_PATTERN.search(action_text)
             if pa_match:
                 public_act_number = pa_match.group(1)
+                enactment_date = action_date  # Date when it became a public act
 
             # Track latest action
             if action_text:
@@ -681,6 +799,8 @@ def parse_bill_xml(xml_content: str, filename: str, ga_session: int) -> Optional
         "synopsis": synopsis[:1000] if synopsis else None,  # Truncate long synopsis
         "latest_action_text": latest_action_text[:500] if latest_action_text else None,
         "latest_action_date": latest_action_date,
+        "filing_date": filing_date,
+        "enactment_date": enactment_date,
         "public_act_number": public_act_number,
     }
 
@@ -958,6 +1078,9 @@ def _rebuild_stats_from_db(ga_session: int, all_members: List[Dict[str, Any]], m
                 "bill_id": bill["bill_id"],
                 "sponsor_member_id": sponsor_id,
             })
+
+    # Calculate advanced metrics (velocity, bipartisan score)
+    _calculate_advanced_metrics(by_member, db_bills, all_members, matcher)
 
     # Build response
     rows = sorted(by_member.values(), key=lambda r: (-r["sponsored_total"], r["sponsorName"] or ""))
@@ -1254,6 +1377,9 @@ def build_il_stats(ga_session: int, incremental: bool = True) -> Dict[str, Any]:
 
     # Add unmatched from matcher
     unmatched_count += len(matcher.unmatched)
+
+    # Step 5b: Calculate velocity and bipartisan score for each member
+    _calculate_advanced_metrics(by_member, all_bills, all_members, matcher)
 
     # Step 6: Build response
     rows = sorted(by_member.values(), key=lambda r: (-r["sponsored_total"], r["sponsorName"] or ""))

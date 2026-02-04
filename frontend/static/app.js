@@ -206,6 +206,13 @@ function renderIllinois() {
       const bSpon = b.primary_sponsor_total ?? b.sponsored_total ?? 0;
       va = calcSuccessRate(a.enacted_total || 0, aSpon);
       vb = calcSuccessRate(b.enacted_total || 0, bSpon);
+    } else if (sortKey === 'avg_days_to_enactment') {
+      // Null values go to end
+      va = a.avg_days_to_enactment ?? 9999;
+      vb = b.avg_days_to_enactment ?? 9999;
+    } else if (sortKey === 'bipartisan_score') {
+      va = a.bipartisan_score ?? -1;
+      vb = b.bipartisan_score ?? -1;
     } else {
       va = a[sortKey] ?? '';
       vb = b[sortKey] ?? '';
@@ -224,6 +231,8 @@ function renderIllinois() {
     const sponsored = r.primary_sponsor_total ?? r.sponsored_total ?? 0;
     const enacted = r.enacted_total || 0;
     const successRate = calcSuccessRate(enacted, sponsored);
+    const avgDays = r.avg_days_to_enactment;
+    const bipartisan = r.bipartisan_score;
     return `
     <tr>
       <td>${r.sponsorName || '—'}</td>
@@ -235,6 +244,8 @@ function renderIllinois() {
       <td class="right">${fmt(r.co_sponsor_total || 0)}</td>
       <td class="right">${fmt(enacted)}</td>
       <td class="right">${fmtPct(successRate)}</td>
+      <td class="right">${avgDays != null ? avgDays : '—'}</td>
+      <td class="right">${bipartisan != null ? fmtPct(bipartisan) : '—'}</td>
     </tr>
   `;}).join('');
 
@@ -253,8 +264,14 @@ function renderIllinois() {
 function render() {
   if (currentLegislature === 'congress') {
     renderCongress();
+    // Hide Illinois-specific sections
+    document.getElementById('timelineSection').style.display = 'none';
+    document.getElementById('networkSection').style.display = 'none';
   } else {
     renderIllinois();
+    // Show and render Illinois-specific visualizations
+    renderTimeline();
+    renderNetwork();
   }
   renderPartyStats();
   renderLeaderboard();
@@ -345,6 +362,18 @@ function renderLeaderboard() {
       }))
       .sort((a, b) => b._successRate - a._successRate);
     valueFormatter = (r) => fmtPct(r._successRate);
+  } else if (currentLeaderboard === 'bipartisan') {
+    // Only include legislators with bipartisan score data
+    sorted = currentData
+      .filter(r => r.bipartisan_score != null && r.bipartisan_score > 0)
+      .sort((a, b) => (b.bipartisan_score || 0) - (a.bipartisan_score || 0));
+    valueFormatter = (r) => fmtPct(r.bipartisan_score || 0);
+  } else if (currentLeaderboard === 'velocity') {
+    // Only include legislators with enacted bills (and thus velocity data)
+    sorted = currentData
+      .filter(r => r.avg_days_to_enactment != null && (r.enacted_total || 0) > 0)
+      .sort((a, b) => (a.avg_days_to_enactment || 999) - (b.avg_days_to_enactment || 999)); // Lower is better
+    valueFormatter = (r) => (r.avg_days_to_enactment || 0) + ' days';
   }
 
   const top10 = sorted.slice(0, 10);
@@ -545,7 +574,9 @@ function setupSortHandlers(headerElements, tableType) {
           'public_law_count',
           'private_law_count',
           'district',
-          'success_rate'
+          'success_rate',
+          'avg_days_to_enactment',
+          'bipartisan_score'
         ];
         sortDir = numericCols.includes(key) ? 'desc' : 'asc';
       }
@@ -585,6 +616,245 @@ leaderboardTabs.forEach(tab => {
     renderLeaderboard();
   });
 });
+
+// ==========================================
+// Timeline Chart
+// ==========================================
+let timelineChart = null;
+
+async function renderTimeline() {
+  const section = document.getElementById('timelineSection');
+  if (currentLegislature !== 'illinois') {
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = 'block';
+
+  const session = parseInt(ilSessionSelect.value || '104', 10);
+  try {
+    const resp = await fetch(`/api/il-timeline?session=${encodeURIComponent(session)}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+
+    const ctx = document.getElementById('timelineChart').getContext('2d');
+
+    // Destroy previous chart if exists
+    if (timelineChart) {
+      timelineChart.destroy();
+    }
+
+    // Format month labels nicely (YYYY-MM -> Month YYYY)
+    const labels = data.months.map(m => {
+      const [year, month] = m.split('-');
+      const date = new Date(parseInt(year), parseInt(month) - 1);
+      return date.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+    });
+
+    timelineChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [
+          {
+            label: 'Bills Filed',
+            data: data.filed,
+            borderColor: '#4a90d9',
+            backgroundColor: 'rgba(74, 144, 217, 0.1)',
+            fill: true,
+            tension: 0.3,
+          },
+          {
+            label: 'Bills Enacted',
+            data: data.enacted,
+            borderColor: '#2ecc71',
+            backgroundColor: 'rgba(46, 204, 113, 0.1)',
+            fill: true,
+            tension: 0.3,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'top',
+          },
+          title: {
+            display: false,
+          },
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            title: {
+              display: true,
+              text: 'Number of Bills',
+            },
+          },
+          x: {
+            title: {
+              display: true,
+              text: 'Month',
+            },
+          },
+        },
+      },
+    });
+  } catch (e) {
+    console.error('Error loading timeline:', e);
+  }
+}
+
+// ==========================================
+// Co-sponsor Network Graph
+// ==========================================
+let networkSimulation = null;
+
+async function renderNetwork() {
+  const section = document.getElementById('networkSection');
+  if (currentLegislature !== 'illinois') {
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = 'block';
+
+  const session = parseInt(ilSessionSelect.value || '104', 10);
+  const minConnections = parseInt(document.getElementById('networkMinConnections').value || '3', 10);
+  const showLabels = document.getElementById('networkShowLabels').checked;
+
+  try {
+    const resp = await fetch(`/api/il-network?session=${encodeURIComponent(session)}&min_connections=${minConnections}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+
+    const container = document.getElementById('networkContainer');
+    container.innerHTML = '';
+
+    if (!data.nodes.length) {
+      container.innerHTML = '<p class="muted">No co-sponsor connections found with minimum ' + minConnections + ' shared bills.</p>';
+      return;
+    }
+
+    // Set up SVG dimensions
+    const width = container.clientWidth || 800;
+    const height = 500;
+
+    const svg = d3.select(container)
+      .append('svg')
+      .attr('width', width)
+      .attr('height', height)
+      .attr('viewBox', [0, 0, width, height]);
+
+    // Color scale by party
+    const partyColor = (party) => {
+      const p = (party || '').toUpperCase();
+      if (p === 'D') return '#3b82f6';
+      if (p === 'R') return '#ef4444';
+      return '#6b7280';
+    };
+
+    // Create simulation
+    if (networkSimulation) {
+      networkSimulation.stop();
+    }
+
+    networkSimulation = d3.forceSimulation(data.nodes)
+      .force('link', d3.forceLink(data.links).id(d => d.id).distance(80))
+      .force('charge', d3.forceManyBody().strength(-200))
+      .force('center', d3.forceCenter(width / 2, height / 2))
+      .force('collision', d3.forceCollide().radius(20));
+
+    // Draw links
+    const link = svg.append('g')
+      .attr('class', 'links')
+      .selectAll('line')
+      .data(data.links)
+      .join('line')
+      .attr('stroke', '#999')
+      .attr('stroke-opacity', 0.6)
+      .attr('stroke-width', d => Math.sqrt(d.value));
+
+    // Draw nodes
+    const node = svg.append('g')
+      .attr('class', 'nodes')
+      .selectAll('circle')
+      .data(data.nodes)
+      .join('circle')
+      .attr('r', 8)
+      .attr('fill', d => partyColor(d.party))
+      .attr('stroke', '#fff')
+      .attr('stroke-width', 1.5)
+      .call(d3.drag()
+        .on('start', dragstarted)
+        .on('drag', dragged)
+        .on('end', dragended));
+
+    // Add tooltips
+    node.append('title')
+      .text(d => `${d.name} (${d.party || '?'}-${d.district || '?'})`);
+
+    // Add labels if enabled
+    let labels = null;
+    if (showLabels) {
+      labels = svg.append('g')
+        .attr('class', 'labels')
+        .selectAll('text')
+        .data(data.nodes)
+        .join('text')
+        .text(d => d.name.split(' ').pop())  // Last name only
+        .attr('font-size', '10px')
+        .attr('dx', 12)
+        .attr('dy', 4);
+    }
+
+    // Update positions on tick
+    networkSimulation.on('tick', () => {
+      link
+        .attr('x1', d => d.source.x)
+        .attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x)
+        .attr('y2', d => d.target.y);
+
+      node
+        .attr('cx', d => d.x)
+        .attr('cy', d => d.y);
+
+      if (labels) {
+        labels
+          .attr('x', d => d.x)
+          .attr('y', d => d.y);
+      }
+    });
+
+    function dragstarted(event, d) {
+      if (!event.active) networkSimulation.alphaTarget(0.3).restart();
+      d.fx = d.x;
+      d.fy = d.y;
+    }
+
+    function dragged(event, d) {
+      d.fx = event.x;
+      d.fy = event.y;
+    }
+
+    function dragended(event, d) {
+      if (!event.active) networkSimulation.alphaTarget(0);
+      d.fx = null;
+      d.fy = null;
+    }
+
+  } catch (e) {
+    console.error('Error loading network:', e);
+  }
+}
+
+// ==========================================
+// Event Handlers - Timeline & Network
+// ==========================================
+document.getElementById('networkRefresh').addEventListener('click', renderNetwork);
+document.getElementById('networkShowLabels').addEventListener('change', renderNetwork);
+document.getElementById('networkMinConnections').addEventListener('change', renderNetwork);
 
 // ==========================================
 // Initialize

@@ -178,3 +178,104 @@ tbody tr:hover { background: #f8fafc; }
 .lb-value { float: right; font-weight: 600; color: #111; }
 .lb-party.dem { color: #3b82f6; }
 .lb-party.rep { color: #ef4444; }
+
+/* Section titles */
+.section-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 0 0 1rem 0;
+  color: #374151;
+}
+
+/* Timeline Section */
+.timeline-section {
+  background: #fff;
+  border-radius: 12px;
+  padding: 1.25rem;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+
+.timeline-chart-container {
+  height: 300px;
+  position: relative;
+}
+
+/* Network Section */
+.network-section {
+  background: #fff;
+  border-radius: 12px;
+  padding: 1.25rem;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+
+.network-controls {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+  font-size: 0.9rem;
+}
+
+.network-controls label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: #6b7280;
+}
+
+.network-container {
+  height: 500px;
+  border: 1px solid #eef2f7;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fafbfc;
+}
+
+/* Network graph styles */
+.network-container svg {
+  width: 100%;
+  height: 100%;
+}
+
+.network-node {
+  cursor: pointer;
+}
+
+.network-node circle {
+  stroke: #fff;
+  stroke-width: 2px;
+}
+
+.network-node.dem circle { fill: #3b82f6; }
+.network-node.rep circle { fill: #ef4444; }
+.network-node.other circle { fill: #9ca3af; }
+
+.network-node text {
+  font-size: 10px;
+  fill: #374151;
+  pointer-events: none;
+}
+
+.network-link {
+  stroke: #d1d5db;
+  stroke-opacity: 0.6;
+}
+
+.network-node:hover circle {
+  stroke: #111;
+  stroke-width: 3px;
+}
+
+/* Tooltip for network */
+.network-tooltip {
+  position: absolute;
+  background: #111;
+  color: #fff;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  pointer-events: none;
+  z-index: 100;
+  white-space: nowrap;
+}

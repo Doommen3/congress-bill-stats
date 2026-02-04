@@ -117,6 +117,8 @@ def init_il_database():
             "primary_sponsor_name": "TEXT",
             "chief_co_sponsors": "TEXT",
             "co_sponsors": "TEXT",
+            "filing_date": "TEXT",
+            "enactment_date": "TEXT",
         })
 
         conn.commit()
@@ -220,6 +222,8 @@ def save_il_bills_batch(ga_session: int, bills: List[Dict[str, Any]]):
                 b.get("synopsis"),
                 b.get("latest_action_text"),
                 b.get("latest_action_date"),
+                b.get("filing_date"),
+                b.get("enactment_date"),
                 b.get("public_act_number"),
                 now
             ))
@@ -228,8 +232,9 @@ def save_il_bills_batch(ga_session: int, bills: List[Dict[str, Any]]):
             INSERT OR REPLACE INTO il_bills
             (bill_id, ga_session, bill_type, bill_number, sponsor_member_id, sponsor_name_raw,
              primary_sponsor_name, chief_co_sponsors, co_sponsors,
-             title, synopsis, latest_action_text, latest_action_date, public_act_number, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             title, synopsis, latest_action_text, latest_action_date, filing_date, enactment_date,
+             public_act_number, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, data)
         conn.commit()
         print(f"[il_db] Saved {len(data)} IL bills for session {ga_session}", flush=True)
@@ -497,7 +502,7 @@ def update_il_bill(bill_id: str, data: Dict[str, Any]) -> None:
         allowed_fields = [
             "public_act_number", "latest_action_date", "latest_action_text",
             "sponsor_member_id", "primary_sponsor_name", "chief_co_sponsors",
-            "co_sponsors", "title", "synopsis"
+            "co_sponsors", "title", "synopsis", "filing_date", "enactment_date"
         ]
 
         for field in allowed_fields:
@@ -522,6 +527,183 @@ def update_il_bill(bill_id: str, data: Dict[str, Any]) -> None:
         query = f"UPDATE il_bills SET {', '.join(update_fields)} WHERE bill_id = ?"
         cursor.execute(query, values)
         conn.commit()
+
+
+def get_il_timeline_data(ga_session: int) -> Dict[str, Any]:
+    """
+    Get bill activity data for timeline visualization.
+    Returns bills aggregated by month for filing and enactment dates.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Get filing dates
+        cursor.execute("""
+            SELECT filing_date, COUNT(*) as count
+            FROM il_bills
+            WHERE ga_session = ? AND filing_date IS NOT NULL AND filing_date != ''
+            GROUP BY substr(filing_date, 1, 7)
+            ORDER BY filing_date
+        """, (ga_session,))
+
+        # Parse and aggregate by month (filing_date is M/D/YYYY format)
+        filed_by_month: Dict[str, int] = {}
+        for row in cursor.fetchall():
+            date_str = row["filing_date"]
+            try:
+                # Parse M/D/YYYY and convert to YYYY-MM
+                parts = date_str.split("/")
+                if len(parts) == 3:
+                    month_key = f"{parts[2]}-{parts[0].zfill(2)}"
+                    filed_by_month[month_key] = filed_by_month.get(month_key, 0) + row["count"]
+            except (ValueError, IndexError):
+                continue
+
+        # Get enactment dates
+        cursor.execute("""
+            SELECT enactment_date, COUNT(*) as count
+            FROM il_bills
+            WHERE ga_session = ? AND enactment_date IS NOT NULL AND enactment_date != ''
+                AND public_act_number IS NOT NULL AND public_act_number != ''
+            GROUP BY substr(enactment_date, 1, 7)
+            ORDER BY enactment_date
+        """, (ga_session,))
+
+        enacted_by_month: Dict[str, int] = {}
+        for row in cursor.fetchall():
+            date_str = row["enactment_date"]
+            try:
+                parts = date_str.split("/")
+                if len(parts) == 3:
+                    month_key = f"{parts[2]}-{parts[0].zfill(2)}"
+                    enacted_by_month[month_key] = enacted_by_month.get(month_key, 0) + row["count"]
+            except (ValueError, IndexError):
+                continue
+
+        # Get all months in order
+        all_months = sorted(set(list(filed_by_month.keys()) + list(enacted_by_month.keys())))
+
+        return {
+            "ga_session": ga_session,
+            "months": all_months,
+            "filed": [filed_by_month.get(m, 0) for m in all_months],
+            "enacted": [enacted_by_month.get(m, 0) for m in all_months],
+        }
+
+
+def get_il_network_data(ga_session: int, min_connections: int = 3) -> Dict[str, Any]:
+    """
+    Get co-sponsor network data for D3.js visualization.
+    Returns nodes (legislators) and links (co-sponsorship relationships).
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Get all bills with sponsors and co-sponsors
+        cursor.execute("""
+            SELECT
+                b.bill_id,
+                b.sponsor_member_id,
+                b.chief_co_sponsors,
+                b.co_sponsors,
+                l.name as sponsor_name,
+                l.party as sponsor_party
+            FROM il_bills b
+            LEFT JOIN il_legislators l ON b.sponsor_member_id = l.member_id
+            WHERE b.ga_session = ? AND b.sponsor_member_id IS NOT NULL
+        """, (ga_session,))
+
+        # Build connection counts between legislators
+        connections: Dict[tuple, int] = {}  # (member1, member2) -> count
+        legislator_info: Dict[str, Dict[str, Any]] = {}
+
+        # Get all legislators for lookup
+        cursor.execute("""
+            SELECT member_id, name, party, chamber, district
+            FROM il_legislators WHERE ga_session = ?
+        """, (ga_session,))
+
+        for row in cursor.fetchall():
+            legislator_info[row["member_id"]] = {
+                "id": row["member_id"],
+                "name": row["name"],
+                "party": row["party"],
+                "chamber": row["chamber"],
+                "district": row["district"],
+            }
+
+        # Process bills for co-sponsorship links
+        for row in cursor.fetchall():
+            sponsor_id = row["sponsor_member_id"]
+            if not sponsor_id:
+                continue
+
+            # Parse co-sponsors JSON
+            chief_co = []
+            co = []
+            try:
+                chief_co = json.loads(row["chief_co_sponsors"] or "[]")
+            except json.JSONDecodeError:
+                pass
+            try:
+                co = json.loads(row["co_sponsors"] or "[]")
+            except json.JSONDecodeError:
+                pass
+
+            all_cosponsors = chief_co + co
+
+            # For each co-sponsor, create a link to the primary sponsor
+            for cosponsor_name in all_cosponsors:
+                # Find cosponsor by name match (simplified - uses exact match on normalized name)
+                cosponsor_id = None
+                normalized = cosponsor_name.lower().strip()
+                for lid, linfo in legislator_info.items():
+                    if linfo["name"].lower().strip() == normalized:
+                        cosponsor_id = lid
+                        break
+
+                if not cosponsor_id or cosponsor_id == sponsor_id:
+                    continue
+
+                # Create sorted pair for undirected link
+                pair = tuple(sorted([sponsor_id, cosponsor_id]))
+                connections[pair] = connections.get(pair, 0) + 1
+
+        # Filter to only connections >= min_connections
+        filtered_connections = {k: v for k, v in connections.items() if v >= min_connections}
+
+        # Build nodes and links
+        active_ids = set()
+        for (id1, id2), count in filtered_connections.items():
+            active_ids.add(id1)
+            active_ids.add(id2)
+
+        nodes = []
+        for lid in active_ids:
+            if lid in legislator_info:
+                info = legislator_info[lid]
+                nodes.append({
+                    "id": lid,
+                    "name": info["name"],
+                    "party": info["party"],
+                    "chamber": info["chamber"],
+                    "district": info["district"],
+                })
+
+        links = []
+        for (id1, id2), count in filtered_connections.items():
+            links.append({
+                "source": id1,
+                "target": id2,
+                "value": count,
+            })
+
+        return {
+            "ga_session": ga_session,
+            "nodes": nodes,
+            "links": links,
+            "min_connections": min_connections,
+        }
 
 
 # Initialize IL database tables on module import

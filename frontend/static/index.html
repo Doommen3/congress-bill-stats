@@ -6,6 +6,10 @@
   <title>Legislative Bill Stats</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/static/styles.css">
+  <!-- Chart.js for timeline -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <!-- D3.js for network graph -->
+  <script src="https://cdn.jsdelivr.net/npm/d3@7.8.5/dist/d3.min.js"></script>
 </head>
 <body>
   <div class="container">
@@ -103,10 +107,31 @@
         <button class="lb-tab active" data-lb="sponsored">Most Bills Sponsored</button>
         <button class="lb-tab" data-lb="enacted">Most Bills Enacted</button>
         <button class="lb-tab" data-lb="success">Highest Success Rate</button>
+        <button class="lb-tab" data-lb="bipartisan">Most Bipartisan</button>
+        <button class="lb-tab" data-lb="velocity">Fastest to Enact</button>
       </div>
       <div class="leaderboard-content">
         <ol id="leaderboardList" class="leaderboard-list"></ol>
       </div>
+    </section>
+
+    <!-- Timeline View (Illinois only) -->
+    <section id="timelineSection" class="timeline-section mb" style="display: none;">
+      <h3 class="section-title">Legislative Activity Timeline</h3>
+      <div class="timeline-chart-container">
+        <canvas id="timelineChart"></canvas>
+      </div>
+    </section>
+
+    <!-- Co-sponsor Network (Illinois only) -->
+    <section id="networkSection" class="network-section mb" style="display: none;">
+      <h3 class="section-title">Co-sponsor Network</h3>
+      <div class="network-controls">
+        <label><input type="checkbox" id="networkShowLabels" checked> Show names</label>
+        <label>Min connections: <input type="number" id="networkMinConnections" value="3" min="1" max="20" style="width: 60px;"></label>
+        <button id="networkRefresh" class="btn secondary">Refresh</button>
+      </div>
+      <div id="networkContainer" class="network-container"></div>
     </section>
 
     <div class="card">
@@ -143,6 +168,8 @@
             <th data-key="co_sponsor_total" class="th-sort il-sort right">Co</th>
             <th data-key="enacted_total" class="th-sort il-sort right">Enacted</th>
             <th data-key="success_rate" class="th-sort il-sort right">Success %</th>
+            <th data-key="avg_days_to_enactment" class="th-sort il-sort right">Avg Days</th>
+            <th data-key="bipartisan_score" class="th-sort il-sort right">Bipartisan %</th>
           </tr>
         </thead>
         <tbody id="ilTbody"></tbody>

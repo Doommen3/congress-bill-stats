@@ -1363,6 +1363,41 @@ def il_sessions():
     return JSONResponse({"sessions": il_stats.get_available_sessions()})
 
 
+@app.get("/api/il-timeline")
+def api_il_timeline(
+    session: int = Query(DEFAULT_IL_SESSION, ge=98, le=999, description="Illinois GA session number"),
+):
+    """
+    Get Illinois timeline data for chart visualization.
+    Returns bills filed and enacted aggregated by month.
+    """
+    try:
+        from . import illinois_database as il_db
+    except ImportError:
+        import illinois_database as il_db
+
+    data = il_db.get_il_timeline_data(session)
+    return JSONResponse(data)
+
+
+@app.get("/api/il-network")
+def api_il_network(
+    session: int = Query(DEFAULT_IL_SESSION, ge=98, le=999, description="Illinois GA session number"),
+    min_connections: int = Query(3, ge=1, le=50, description="Minimum co-sponsorship connections to include"),
+):
+    """
+    Get Illinois co-sponsor network data for D3.js visualization.
+    Returns nodes (legislators) and links (co-sponsorship relationships).
+    """
+    try:
+        from . import illinois_database as il_db
+    except ImportError:
+        import illinois_database as il_db
+
+    data = il_db.get_il_network_data(session, min_connections=min_connections)
+    return JSONResponse(data)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     """Serve the frontend index.html"""
