@@ -1,0 +1,471 @@
+"""
+SQLite database module for Illinois General Assembly Bill Stats.
+Provides persistent storage for IL legislators, bills, and laws data.
+"""
+import os
+import sqlite3
+import json
+import time
+from typing import Dict, Any, List, Optional
+from contextlib import contextmanager
+
+# Database path - uses same database as Congress stats
+DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(os.path.dirname(__file__), "congress_stats.db"))
+
+
+@contextmanager
+def get_db_connection():
+    """Context manager for database connections."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _ensure_table_columns(cursor: sqlite3.Cursor, table: str, columns: Dict[str, str]) -> None:
+    """Ensure a table has the requested columns, adding any that are missing."""
+    cursor.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in cursor.fetchall()}
+    for name, col_type in columns.items():
+        if name in existing:
+            continue
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
+
+
+def init_il_database():
+    """Initialize the Illinois-specific database schema."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # IL Legislators table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS il_legislators (
+                member_id TEXT PRIMARY KEY,
+                ga_session INTEGER NOT NULL,
+                chamber TEXT NOT NULL,
+                district INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                first_name TEXT,
+                last_name TEXT,
+                party TEXT,
+                title TEXT,
+                updated_at INTEGER
+            )
+        """)
+
+        # IL Bills table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS il_bills (
+                bill_id TEXT PRIMARY KEY,
+                ga_session INTEGER NOT NULL,
+                bill_type TEXT NOT NULL,
+                bill_number INTEGER NOT NULL,
+                sponsor_member_id TEXT,
+                sponsor_name_raw TEXT,
+                primary_sponsor_name TEXT,
+                chief_co_sponsors TEXT,
+                co_sponsors TEXT,
+                title TEXT,
+                synopsis TEXT,
+                latest_action_text TEXT,
+                latest_action_date TEXT,
+                public_act_number TEXT,
+                updated_at INTEGER,
+                FOREIGN KEY (sponsor_member_id) REFERENCES il_legislators(member_id)
+            )
+        """)
+
+        # IL Laws table (for enacted bills)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS il_laws (
+                law_id TEXT PRIMARY KEY,
+                ga_session INTEGER NOT NULL,
+                public_act_number TEXT NOT NULL,
+                bill_id TEXT,
+                sponsor_member_id TEXT,
+                effective_date TEXT,
+                updated_at INTEGER,
+                FOREIGN KEY (bill_id) REFERENCES il_bills(bill_id),
+                FOREIGN KEY (sponsor_member_id) REFERENCES il_legislators(member_id)
+            )
+        """)
+
+        # IL Cache metadata
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS il_cache_metadata (
+                ga_session INTEGER PRIMARY KEY,
+                last_full_refresh INTEGER,
+                total_bills INTEGER,
+                total_laws INTEGER,
+                total_members INTEGER,
+                unmatched_sponsors INTEGER,
+                stats_json TEXT
+            )
+        """)
+
+        # Create indexes for faster queries
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_il_bills_session ON il_bills(ga_session)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_il_bills_sponsor ON il_bills(sponsor_member_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_il_laws_session ON il_laws(ga_session)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_il_laws_sponsor ON il_laws(sponsor_member_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_il_legislators_session ON il_legislators(ga_session)")
+
+        # Ensure new sponsor role columns exist in existing databases
+        _ensure_table_columns(cursor, "il_bills", {
+            "primary_sponsor_name": "TEXT",
+            "chief_co_sponsors": "TEXT",
+            "co_sponsors": "TEXT",
+        })
+
+        conn.commit()
+        print(f"[il_db] Illinois database tables initialized", flush=True)
+
+
+def save_il_legislator(member_id: str, ga_session: int, chamber: str, district: int,
+                       name: str, first_name: str = None, last_name: str = None,
+                       party: str = None, title: str = None):
+    """Save or update an Illinois legislator."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO il_legislators
+            (member_id, ga_session, chamber, district, name, first_name, last_name, party, title, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (member_id, ga_session, chamber, district, name, first_name, last_name,
+              party, title, int(time.time())))
+        conn.commit()
+
+
+def save_il_legislators_batch(ga_session: int, legislators: List[Dict[str, Any]]):
+    """Save multiple Illinois legislators in a single transaction."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        now = int(time.time())
+        data = []
+        for leg in legislators:
+            member_id = leg.get("member_id")
+            if not member_id:
+                continue
+            data.append((
+                member_id,
+                ga_session,
+                leg.get("chamber", ""),
+                leg.get("district", 0),
+                leg.get("name", ""),
+                leg.get("first_name"),
+                leg.get("last_name"),
+                leg.get("party"),
+                leg.get("title"),
+                now
+            ))
+
+        cursor.executemany("""
+            INSERT OR REPLACE INTO il_legislators
+            (member_id, ga_session, chamber, district, name, first_name, last_name, party, title, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, data)
+        conn.commit()
+        print(f"[il_db] Saved {len(data)} IL legislators for session {ga_session}", flush=True)
+
+
+def save_il_bill(ga_session: int, bill_type: str, bill_number: int,
+                 sponsor_member_id: str = None, sponsor_name_raw: str = None,
+                 primary_sponsor_name: str = None, chief_co_sponsors: List[str] = None,
+                 co_sponsors: List[str] = None,
+                 title: str = None, synopsis: str = None,
+                 latest_action_text: str = None, latest_action_date: str = None,
+                 public_act_number: str = None):
+    """Save or update an Illinois bill."""
+    bill_id = f"{ga_session}-{bill_type.lower()}-{bill_number}"
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO il_bills
+            (bill_id, ga_session, bill_type, bill_number, sponsor_member_id, sponsor_name_raw,
+             primary_sponsor_name, chief_co_sponsors, co_sponsors,
+             title, synopsis, latest_action_text, latest_action_date, public_act_number, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (bill_id, ga_session, bill_type.lower(), bill_number, sponsor_member_id,
+              sponsor_name_raw, primary_sponsor_name, json.dumps(chief_co_sponsors or []),
+              json.dumps(co_sponsors or []), title, synopsis, latest_action_text, latest_action_date,
+              public_act_number, int(time.time())))
+        conn.commit()
+
+
+def save_il_bills_batch(ga_session: int, bills: List[Dict[str, Any]]):
+    """Save multiple Illinois bills in a single transaction."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        now = int(time.time())
+        data = []
+        for b in bills:
+            bill_type = (b.get("bill_type") or "").lower()
+            bill_number = b.get("bill_number")
+            if not bill_type or bill_number is None:
+                continue
+            bill_id = f"{ga_session}-{bill_type}-{bill_number}"
+            data.append((
+                bill_id,
+                ga_session,
+                bill_type,
+                bill_number,
+                b.get("sponsor_member_id"),
+                b.get("sponsor_name_raw"),
+                b.get("primary_sponsor_name"),
+                json.dumps(b.get("chief_co_sponsors") or []),
+                json.dumps(b.get("co_sponsors") or []),
+                b.get("title"),
+                b.get("synopsis"),
+                b.get("latest_action_text"),
+                b.get("latest_action_date"),
+                b.get("public_act_number"),
+                now
+            ))
+
+        cursor.executemany("""
+            INSERT OR REPLACE INTO il_bills
+            (bill_id, ga_session, bill_type, bill_number, sponsor_member_id, sponsor_name_raw,
+             primary_sponsor_name, chief_co_sponsors, co_sponsors,
+             title, synopsis, latest_action_text, latest_action_date, public_act_number, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, data)
+        conn.commit()
+        print(f"[il_db] Saved {len(data)} IL bills for session {ga_session}", flush=True)
+
+
+def save_il_law(ga_session: int, public_act_number: str, bill_id: str = None,
+                sponsor_member_id: str = None, effective_date: str = None):
+    """Save or update an Illinois law."""
+    law_id = f"PA-{public_act_number}"
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO il_laws
+            (law_id, ga_session, public_act_number, bill_id, sponsor_member_id, effective_date, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (law_id, ga_session, public_act_number, bill_id, sponsor_member_id,
+              effective_date, int(time.time())))
+        conn.commit()
+
+
+def save_il_laws_batch(ga_session: int, laws: List[Dict[str, Any]]):
+    """Save multiple Illinois laws in a single transaction."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        now = int(time.time())
+        data = []
+        for law in laws:
+            public_act_number = law.get("public_act_number")
+            if not public_act_number:
+                continue
+            law_id = f"PA-{public_act_number}"
+            data.append((
+                law_id,
+                ga_session,
+                public_act_number,
+                law.get("bill_id"),
+                law.get("sponsor_member_id"),
+                law.get("effective_date"),
+                now
+            ))
+
+        cursor.executemany("""
+            INSERT OR REPLACE INTO il_laws
+            (law_id, ga_session, public_act_number, bill_id, sponsor_member_id, effective_date, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, data)
+        conn.commit()
+        print(f"[il_db] Saved {len(data)} IL laws for session {ga_session}", flush=True)
+
+
+def save_il_stats_cache(ga_session: int, stats: Dict[str, Any]):
+    """Save computed Illinois stats to cache."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        summary = stats.get("summary", {})
+        cursor.execute("""
+            INSERT OR REPLACE INTO il_cache_metadata
+            (ga_session, last_full_refresh, total_bills, total_laws, total_members, unmatched_sponsors, stats_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            ga_session,
+            int(time.time()),
+            summary.get("total_bills", 0),
+            summary.get("total_laws", 0),
+            summary.get("total_legislators", 0),
+            stats.get("unmatched_sponsors", 0),
+            json.dumps(stats)
+        ))
+        conn.commit()
+        print(f"[il_db] Saved stats cache for IL session {ga_session}", flush=True)
+
+
+def load_il_stats_cache(ga_session: int) -> Optional[Dict[str, Any]]:
+    """Load cached Illinois stats from database."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT stats_json, last_full_refresh FROM il_cache_metadata WHERE ga_session = ?
+        """, (ga_session,))
+        row = cursor.fetchone()
+        if row and row["stats_json"]:
+            stats = json.loads(row["stats_json"])
+            print(f"[il_db] Loaded stats cache for IL session {ga_session} (cached at {row['last_full_refresh']})", flush=True)
+            return stats
+        return None
+
+
+def get_il_cache_metadata(ga_session: int) -> Optional[Dict[str, Any]]:
+    """Get cache metadata without the full stats JSON."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT ga_session, last_full_refresh, total_bills, total_laws, total_members, unmatched_sponsors
+            FROM il_cache_metadata WHERE ga_session = ?
+        """, (ga_session,))
+        row = cursor.fetchone()
+        if row:
+            return {
+                "ga_session": row["ga_session"],
+                "last_full_refresh": row["last_full_refresh"],
+                "total_bills": row["total_bills"],
+                "total_laws": row["total_laws"],
+                "total_members": row["total_members"],
+                "unmatched_sponsors": row["unmatched_sponsors"],
+            }
+        return None
+
+
+def get_il_stats_from_db(ga_session: int) -> Optional[Dict[str, Any]]:
+    """
+    Compute Illinois stats directly from the database tables.
+    Useful when we have the raw data but no cached stats.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Get legislator stats with bill and law counts
+        cursor.execute("""
+            SELECT
+                l.member_id,
+                l.name as sponsor_name,
+                l.party,
+                l.chamber,
+                l.district,
+                COUNT(DISTINCT b.bill_id) as sponsored_total,
+                COUNT(DISTINCT law.law_id) as enacted_total
+            FROM il_legislators l
+            LEFT JOIN il_bills b ON l.member_id = b.sponsor_member_id AND b.ga_session = ?
+            LEFT JOIN il_laws law ON b.bill_id = law.bill_id AND law.ga_session = ?
+            WHERE l.ga_session = ?
+            GROUP BY l.member_id
+            HAVING sponsored_total > 0
+            ORDER BY sponsored_total DESC, sponsor_name ASC
+        """, (ga_session, ga_session, ga_session))
+
+        rows = []
+        for row in cursor.fetchall():
+            rows.append({
+                "memberId": row["member_id"],
+                "sponsorName": row["sponsor_name"],
+                "party": row["party"],
+                "chamber": row["chamber"],
+                "district": row["district"],
+                "sponsored_total": row["sponsored_total"],
+                "enacted_total": row["enacted_total"],
+            })
+
+        if not rows:
+            return None
+
+        # Get totals
+        cursor.execute("SELECT COUNT(*) FROM il_bills WHERE ga_session = ?", (ga_session,))
+        total_bills = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM il_laws WHERE ga_session = ?", (ga_session,))
+        total_laws = cursor.fetchone()[0]
+
+        return {
+            "ga_session": ga_session,
+            "generated_at": int(time.time()),
+            "rows": rows,
+            "summary": {
+                "total_legislators": len(rows),
+                "total_bills": total_bills,
+                "total_laws": total_laws,
+            },
+            "note": "Stats computed from database.",
+        }
+
+
+def clear_il_session_data(ga_session: int):
+    """Clear all data for a specific Illinois GA session."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM il_laws WHERE ga_session = ?", (ga_session,))
+        cursor.execute("DELETE FROM il_bills WHERE ga_session = ?", (ga_session,))
+        cursor.execute("DELETE FROM il_legislators WHERE ga_session = ?", (ga_session,))
+        cursor.execute("DELETE FROM il_cache_metadata WHERE ga_session = ?", (ga_session,))
+        conn.commit()
+        print(f"[il_db] Cleared data for IL session {ga_session}", flush=True)
+
+
+def get_il_legislator_by_id(member_id: str) -> Optional[Dict[str, Any]]:
+    """Get a single legislator by member_id."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM il_legislators WHERE member_id = ?
+        """, (member_id,))
+        row = cursor.fetchone()
+        if row:
+            return dict(row)
+        return None
+
+
+def get_il_legislators_by_session(ga_session: int) -> List[Dict[str, Any]]:
+    """Get all legislators for a session."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM il_legislators WHERE ga_session = ? ORDER BY chamber, district
+        """, (ga_session,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_existing_bill_filenames(ga_session: int) -> set:
+    """
+    Get set of bill XML filenames that are already in the database.
+    Returns filenames in format like '10400HB0001.xml'.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT bill_type, bill_number FROM il_bills WHERE ga_session = ?
+        """, (ga_session,))
+
+        filenames = set()
+        for row in cursor.fetchall():
+            bill_type = row["bill_type"].upper()
+            bill_number = row["bill_number"]
+            # Reconstruct filename: 10400HB0001.xml
+            filename = f"{ga_session}00{bill_type}{bill_number:04d}.xml"
+            filenames.add(filename)
+
+        return filenames
+
+
+def get_all_bills_for_session(ga_session: int) -> List[Dict[str, Any]]:
+    """Get all bills for a session from database."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM il_bills WHERE ga_session = ?
+        """, (ga_session,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+# Initialize IL database tables on module import
+init_il_database()

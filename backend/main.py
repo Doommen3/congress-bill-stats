@@ -17,6 +17,12 @@ try:
 except ImportError:
     import database as db
 
+# Import Illinois stats module
+try:
+    from . import illinois_stats as il_stats
+except ImportError:
+    import illinois_stats as il_stats
+
 # =======================
 # Config
 # =======================
@@ -26,6 +32,7 @@ CACHE_DIR = os.environ.get("CACHE_DIR", "./cache")
 DEFAULT_CONGRESS = int(os.environ.get("DEFAULT_CONGRESS", "119"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))  # parallel page fetchers
 DETAIL_WORKERS = int(os.environ.get("DETAIL_WORKERS", "8"))  # parallel item fetchers
+DEFAULT_IL_SESSION = int(os.environ.get("DEFAULT_IL_SESSION", "104"))  # Illinois GA session
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -713,6 +720,62 @@ def refresh_status(congress: int = Query(DEFAULT_CONGRESS, ge=81, le=999)):
     return JSONResponse(status)
 
 
+# -------------------------------
+# Illinois Routes
+# -------------------------------
+@app.get("/api/il-stats")
+def api_il_stats(
+    session: int = Query(DEFAULT_IL_SESSION, ge=98, le=999, description="Illinois GA session number"),
+    refresh: bool = Query(False, description="Force rebuild and refresh cache."),
+    background: bool = Query(False, description="Run refresh in background, return cached data immediately."),
+    background_tasks: BackgroundTasks = None,
+):
+    """
+    Get Illinois legislator statistics for a General Assembly session.
+
+    - If cached data exists and refresh=False, returns cached data immediately.
+    - If refresh=True and background=True, returns cached data and refreshes in background.
+    - If refresh=True and background=False, rebuilds stats synchronously.
+    """
+    print(f"[api_il_stats] start session={session} refresh={refresh} background={background}", flush=True)
+
+    cached = il_stats.load_il_cache(session)
+
+    # If background refresh requested and we have cached data
+    if refresh and background and cached and background_tasks:
+        # Check if already refreshing
+        status = il_stats.get_il_refresh_status(session)
+        if status.get("status") != "running":
+            background_tasks.add_task(il_stats.do_il_background_refresh, session)
+            print(f"[api_il_stats] Started background refresh for IL session {session}", flush=True)
+
+        # Return cached data with refresh status
+        cached["_refresh_status"] = "pending"
+        return JSONResponse(cached)
+
+    # Return cached if not forcing refresh
+    if not refresh and cached:
+        return JSONResponse(cached)
+
+    # Synchronous refresh
+    stats = il_stats.build_il_stats(session)
+    il_stats.save_il_cache(session, stats)
+    return JSONResponse(stats)
+
+
+@app.get("/api/il-refresh-status")
+def il_refresh_status(session: int = Query(DEFAULT_IL_SESSION, ge=98, le=999)):
+    """Check the status of an Illinois background refresh."""
+    status = il_stats.get_il_refresh_status(session)
+    return JSONResponse(status)
+
+
+@app.get("/api/il-sessions")
+def il_sessions():
+    """Return list of available Illinois GA sessions."""
+    return JSONResponse({"sessions": il_stats.get_available_sessions()})
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     """Serve the frontend index.html"""
@@ -721,3 +784,10 @@ def index():
         return HTMLResponse("<h1>Congress Bill Stats</h1><p>Frontend not found.</p>")
     with open(html_path, "r", encoding="utf-8") as f:
         return HTMLResponse(f.read())
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Starting server on http://localhost:{port}", flush=True)
+    uvicorn.run(app, host="0.0.0.0", port=port)

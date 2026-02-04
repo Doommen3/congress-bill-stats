@@ -3,18 +3,27 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Congress Bill Stats</title>
+  <title>Legislative Bill Stats</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
   <div class="container">
     <header class="mb">
-      <h1 class="h1">Congress Bill Stats</h1>
-      <p class="muted">Counts of bills sponsored and enacted (became law) by legislator. Data: Congress.gov API.</p>
+      <h1 class="h1">Legislative Bill Stats</h1>
+      <p class="muted">Counts of bills sponsored and enacted (became law) by legislator.</p>
     </header>
 
-    <section class="controls">
+    <!-- Legislature Toggle -->
+    <section class="legislature-toggle">
+      <div class="toggle-buttons">
+        <button id="congressBtn" class="toggle-btn active">US Congress</button>
+        <button id="illinoisBtn" class="toggle-btn">Illinois GA</button>
+      </div>
+    </section>
+
+    <!-- Congress Controls -->
+    <section id="congressControls" class="controls">
       <div class="control">
         <label>Congress</label>
         <input id="congressInput" type="number" min="81" value="119">
@@ -37,9 +46,37 @@
       </div>
     </section>
 
+    <!-- Illinois Controls -->
+    <section id="illinoisControls" class="controls" style="display: none;">
+      <div class="control">
+        <label>GA Session</label>
+        <select id="ilSessionSelect">
+          <option value="104">104th (2025-2026)</option>
+          <option value="103">103rd (2023-2024)</option>
+        </select>
+      </div>
+      <div class="control">
+        <label>Chamber</label>
+        <select id="ilChamberFilter">
+          <option value="both">Both</option>
+          <option value="house">House</option>
+          <option value="senate">Senate</option>
+        </select>
+      </div>
+      <div class="control">
+        <label>Search (name/district)</label>
+        <input id="ilSearchBox" type="text" placeholder="e.g., Smith or 5">
+      </div>
+      <div class="control buttons">
+        <button id="ilLoadBtn" class="btn">Load / Refresh</button>
+        <button id="ilExportBtn" class="btn secondary">Export CSV</button>
+      </div>
+    </section>
+
     <div id="status" class="muted mb"></div>
 
     <div class="card">
+      <!-- Congress Table -->
       <table id="dataTable">
         <thead>
           <tr>
@@ -55,11 +92,28 @@
         </thead>
         <tbody id="tbody"></tbody>
       </table>
+
+      <!-- Illinois Table (hidden by default) -->
+      <table id="ilDataTable" style="display: none;">
+        <thead>
+          <tr>
+            <th data-key="sponsorName" class="th-sort il-sort">Legislator</th>
+            <th data-key="chamber" class="th-sort il-sort">Chamber</th>
+            <th data-key="party" class="th-sort il-sort">Party</th>
+            <th data-key="district" class="th-sort il-sort right">District</th>
+            <th data-key="primary_sponsor_total" class="th-sort il-sort right">Primary</th>
+            <th data-key="chief_co_sponsor_total" class="th-sort il-sort right">Chief Co</th>
+            <th data-key="co_sponsor_total" class="th-sort il-sort right">Co</th>
+            <th data-key="enacted_total" class="th-sort il-sort right">Enacted</th>
+          </tr>
+        </thead>
+        <tbody id="ilTbody"></tbody>
+      </table>
     </div>
 
     <div id="summary" class="summary muted mb"></div>
 
-    <p class="tiny muted">
+    <p id="dataNote" class="tiny muted">
       Law counts use the Congress.gov /law endpoint for accurate enacted legislation data. First load may take a few minutes; then it's cached.
     </p>
   </div>
