@@ -6,6 +6,7 @@ let currentData = [];
 let currentSummary = null;
 let sortKey = 'sponsored_total';
 let sortDir = 'desc';
+const MIN_BIPARTISAN_EVENTS = 10;
 
 // ==========================================
 // DOM Elements - Congress
@@ -117,7 +118,7 @@ function switchLegislature(legislature) {
   if (legislature === 'congress') {
     dataNoteEl.textContent = 'Law counts use the Congress.gov /law endpoint for accurate enacted legislation data. First load may take a few minutes; then it\'s cached.';
   } else {
-    dataNoteEl.textContent = 'Data from Illinois General Assembly FTP XML files. First load may take a few minutes as bill data is fetched; then it\'s cached.';
+    dataNoteEl.textContent = 'Data from Illinois General Assembly FTP XML files. Most Bipartisan uses an adjusted score and requires at least 10 co-sponsorships in the leaderboard.';
   }
 
   // Reset sort
@@ -265,6 +266,7 @@ function renderIllinois() {
     const successRate = calcSuccessRate(enacted, sponsored);
     const avgDays = r.avg_days_to_enactment;
     const bipartisan = r.bipartisan_score;
+    const bipartisanTotal = r.bipartisan_total || 0;
     return `
     <tr>
       <td>${r.sponsorName || '—'}</td>
@@ -277,7 +279,7 @@ function renderIllinois() {
       <td class="right">${fmt(enacted)}</td>
       <td class="right">${fmtPct(successRate)}</td>
       <td class="right">${avgDays != null ? avgDays : '—'}</td>
-      <td class="right">${bipartisan != null ? fmtPct(bipartisan) : '—'}</td>
+      <td class="right">${bipartisan != null ? `${fmtPct(bipartisan)} (n=${fmt(bipartisanTotal)})` : '—'}</td>
     </tr>
   `;}).join('');
 
@@ -395,11 +397,19 @@ function renderLeaderboard() {
       .sort((a, b) => b._successRate - a._successRate);
     valueFormatter = (r) => fmtPct(r._successRate);
   } else if (currentLeaderboard === 'bipartisan') {
-    // Only include legislators with bipartisan score data
+    // Require enough co-sponsorship volume for stable bipartisan rankings.
     sorted = currentData
-      .filter(r => r.bipartisan_score != null && r.bipartisan_score > 0)
-      .sort((a, b) => (b.bipartisan_score || 0) - (a.bipartisan_score || 0));
-    valueFormatter = (r) => fmtPct(r.bipartisan_score || 0);
+      .filter(r =>
+        r.bipartisan_score != null
+        && (r.bipartisan_cross_party_total || 0) > 0
+        && (r.bipartisan_total || 0) >= MIN_BIPARTISAN_EVENTS
+      )
+      .sort((a, b) => {
+        const scoreDelta = (b.bipartisan_score || 0) - (a.bipartisan_score || 0);
+        if (scoreDelta !== 0) return scoreDelta;
+        return (b.bipartisan_total || 0) - (a.bipartisan_total || 0);
+      });
+    valueFormatter = (r) => `${fmtPct(r.bipartisan_score || 0)} (n=${fmt(r.bipartisan_total || 0)})`;
   } else if (currentLeaderboard === 'velocity') {
     // Only include legislators with enacted bills (and thus velocity data)
     sorted = currentData

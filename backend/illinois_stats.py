@@ -28,6 +28,7 @@ IL_FTP_ROOT = os.environ.get("IL_FTP_ROOT", "https://ilga.gov/ftp")
 IL_CACHE_DIR = os.environ.get("IL_CACHE_DIR", "./cache/illinois")
 IL_MAX_WORKERS = int(os.environ.get("IL_MAX_WORKERS", "4"))  # Lower for FTP politeness
 IL_REQUEST_DELAY = float(os.environ.get("IL_REQUEST_DELAY", "0.1"))  # Delay between requests
+BIPARTISAN_PRIOR_WEIGHT = max(0, int(os.environ.get("IL_BIPARTISAN_PRIOR_WEIGHT", "20")))
 
 os.makedirs(IL_CACHE_DIR, exist_ok=True)
 
@@ -217,10 +218,34 @@ def _create_member_stats_record(member: Dict[str, Any]) -> Dict[str, Any]:
         "enacted_total": 0,
         "public_act_numbers": [],
         # New fields for velocity and bipartisan score
-        "_velocity_days": [],  # List of days to enactment for averaging
-        "_cross_party_cosponsors": 0,  # Count of cross-party co-sponsorships
-        "_total_cosponsored_bills": 0,  # Total bills they co-sponsored
+        "avg_days_to_enactment": None,
+        "bipartisan_score": None,  # Empirical-Bayes adjusted cross-party co-sponsorship rate
+        "bipartisan_score_raw": None,  # Raw cross-party co-sponsorship rate
+        "bipartisan_cross_party_total": 0,
+        "bipartisan_total": 0,
     }
+
+
+def _calculate_smoothed_rate(
+    cross_count: int,
+    total_count: int,
+    baseline_rate: float,
+    prior_weight: int,
+) -> Optional[float]:
+    """
+    Empirical-Bayes smoothing for bipartisan rates.
+    Returns a value in [0, 1], or None when there is no denominator.
+    """
+    if total_count <= 0:
+        return None
+
+    baseline = max(0.0, min(1.0, baseline_rate))
+    weight = max(0, prior_weight)
+    denominator = total_count + weight
+    if denominator <= 0:
+        return None
+
+    return (cross_count + (weight * baseline)) / denominator
 
 
 def _calculate_advanced_metrics(
@@ -232,14 +257,16 @@ def _calculate_advanced_metrics(
     """
     Calculate advanced metrics for each legislator:
     - avg_days_to_enactment: Average days from filing to enactment for enacted bills
-    - bipartisan_score: Percentage of co-sponsored bills from opposite party
+    - bipartisan_score_raw: Raw percentage of co-sponsored bills from opposite party
+    - bipartisan_score: Smoothed bipartisan score adjusted for small sample sizes
     """
     # Build member party lookup
     member_party = {m["member_id"]: m.get("party", "").upper() for m in all_members}
+    member_chamber = {m["member_id"]: m.get("chamber", "") for m in all_members}
 
     # Track velocity and bipartisan data for each member
     velocity_data: Dict[str, List[int]] = {}  # member_id -> list of days
-    bipartisan_data: Dict[str, Dict[str, int]] = {}  # member_id -> {"cross": n, "total": n}
+    bipartisan_data: Dict[str, Dict[str, Any]] = {}
 
     for bill in all_bills:
         sponsor_id = bill.get("sponsor_member_id")
@@ -274,16 +301,40 @@ def _calculate_advanced_metrics(
 
                 cosponsor_id = cosponsor_member["member_id"]
                 cosponsor_party = member_party.get(cosponsor_id, "")
+                cosponsor_chamber = cosponsor_member.get("chamber", "") or member_chamber.get(cosponsor_id, "")
 
                 # Initialize bipartisan tracking for this co-sponsor
                 if cosponsor_id not in bipartisan_data:
-                    bipartisan_data[cosponsor_id] = {"cross": 0, "total": 0}
+                    bipartisan_data[cosponsor_id] = {
+                        "cross": 0,
+                        "total": 0,
+                        "party": cosponsor_party,
+                        "chamber": cosponsor_chamber,
+                    }
 
                 bipartisan_data[cosponsor_id]["total"] += 1
 
                 # Check if cross-party (both have valid parties and they differ)
                 if sponsor_party and cosponsor_party and sponsor_party != cosponsor_party:
                     bipartisan_data[cosponsor_id]["cross"] += 1
+
+    # Build bipartisan baselines by chamber/party group and globally.
+    group_totals: Dict[Tuple[str, str], Dict[str, int]] = {}
+    overall_cross = 0
+    overall_total = 0
+    for counts in bipartisan_data.values():
+        total = counts.get("total", 0)
+        if total <= 0:
+            continue
+        cross = counts.get("cross", 0)
+        group_key = (counts.get("chamber", ""), counts.get("party", ""))
+        bucket = group_totals.setdefault(group_key, {"cross": 0, "total": 0})
+        bucket["cross"] += cross
+        bucket["total"] += total
+        overall_cross += cross
+        overall_total += total
+
+    overall_baseline = (overall_cross / overall_total) if overall_total > 0 else 0.0
 
     # Apply calculated metrics to each member
     for member_id, record in by_member.items():
@@ -297,9 +348,34 @@ def _calculate_advanced_metrics(
         # Bipartisan score
         if member_id in bipartisan_data and bipartisan_data[member_id]["total"] > 0:
             bp = bipartisan_data[member_id]
-            record["bipartisan_score"] = round((bp["cross"] / bp["total"]) * 100, 1)
+            cross = bp["cross"]
+            total = bp["total"]
+            raw_rate = cross / total
+
+            group_key = (member_chamber.get(member_id, ""), member_party.get(member_id, ""))
+            group_bucket = group_totals.get(group_key)
+            if group_bucket and group_bucket["total"] > 0:
+                baseline_rate = group_bucket["cross"] / group_bucket["total"]
+            else:
+                baseline_rate = overall_baseline
+
+            smoothed_rate = _calculate_smoothed_rate(
+                cross_count=cross,
+                total_count=total,
+                baseline_rate=baseline_rate,
+                prior_weight=BIPARTISAN_PRIOR_WEIGHT,
+            )
+            adjusted_rate = raw_rate if smoothed_rate is None else smoothed_rate
+
+            record["bipartisan_cross_party_total"] = cross
+            record["bipartisan_total"] = total
+            record["bipartisan_score_raw"] = round(raw_rate * 100, 1)
+            record["bipartisan_score"] = round(adjusted_rate * 100, 1)
         else:
             record["bipartisan_score"] = None
+            record["bipartisan_score_raw"] = None
+            record["bipartisan_cross_party_total"] = 0
+            record["bipartisan_total"] = 0
 
 
 def _normalize_action_text(text: str) -> str:
