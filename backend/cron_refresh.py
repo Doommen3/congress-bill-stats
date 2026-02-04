@@ -6,6 +6,7 @@ import os
 
 from main import build_stats, save_cache, DEFAULT_CONGRESS, DEFAULT_IL_SESSION
 from illinois_stats import build_il_stats, save_il_cache
+from govinfo_bulk_sync import sync_billstatus_bulk, DEFAULT_BULK_JSON_ROOT
 
 
 def _parse_int_list(value: str) -> list[int]:
@@ -33,9 +34,31 @@ def main() -> None:
         or os.environ.get("ADMIN_CONGRESS_API_KEY")
         or os.environ.get("CONGRESS_API_KEY")
     )
+    cosponsor_mode = os.environ.get("CRON_COSPONSOR_MODE", "full")
+    cosponsor_source = os.environ.get("CRON_COSPONSOR_SOURCE", "auto")
+    sync_bulk = os.environ.get("CRON_SYNC_BILLSTATUS_BULK", "0") == "1"
+    bulk_dir = os.environ.get("BILL_STATUS_BULK_DIR", "").strip()
+    bulk_root = os.environ.get("GOVINFO_BULK_JSON_ROOT", "")
 
     for congress in congress_list:
-        stats = build_stats(congress, api_key=api_key)
+        if sync_bulk and bulk_dir:
+            sync_summary = sync_billstatus_bulk(
+                congress=congress,
+                dest_dir=bulk_dir,
+                api_key=(
+                    os.environ.get("GOVINFO_API_KEY")
+                    or os.environ.get("DATA_GOV_API_KEY")
+                    or api_key
+                ),
+                root_json_url=bulk_root or DEFAULT_BULK_JSON_ROOT,
+            )
+            print(f"[cron] Billstatus sync summary: {sync_summary}", flush=True)
+        stats = build_stats(
+            congress,
+            api_key=api_key,
+            cosponsor_mode=cosponsor_mode,
+            cosponsor_source=cosponsor_source,
+        )
         save_cache(congress, stats)
 
     for session in il_list:

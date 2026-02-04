@@ -30,3 +30,6 @@ node_modules/
 # Ignore HTTP cache files generated at runtime
 backend/cache/http/
 
+# Ignore local GovInfo bulk XML sync output
+cache/billstatus/
+backend/cache/billstatus/

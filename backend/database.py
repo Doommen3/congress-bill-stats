@@ -52,6 +52,9 @@ def init_database():
                 title TEXT,
                 latest_action_text TEXT,
                 latest_action_date TEXT,
+                update_date TEXT,
+                cosponsors_last_update_date TEXT,
+                cosponsors_updated_at INTEGER,
                 updated_at INTEGER,
                 FOREIGN KEY (sponsor_bioguide_id) REFERENCES legislators(bioguide_id)
             )
@@ -109,6 +112,21 @@ def init_database():
         conn.commit()
         print(f"[db] Database initialized at {DB_PATH}", flush=True)
 
+        # Ensure new columns exist in existing databases
+        _ensure_column(cursor, "bills", "update_date", "TEXT")
+        _ensure_column(cursor, "bills", "cosponsors_last_update_date", "TEXT")
+        _ensure_column(cursor, "bills", "cosponsors_updated_at", "INTEGER")
+        conn.commit()
+
+
+def _ensure_column(cursor: sqlite3.Cursor, table: str, column: str, coltype: str) -> None:
+    """Add a column to a table if it does not already exist."""
+    cursor.execute(f"PRAGMA table_info({table})")
+    columns = {row[1] for row in cursor.fetchall()}
+    if column in columns:
+        return
+    cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
 
 def save_legislator(bioguide_id: str, name: str, party: str, state: str, chamber: str):
     """Save or update a legislator."""
@@ -138,19 +156,38 @@ def save_legislators_batch(legislators: List[Dict[str, Any]]):
         print(f"[db] Saved {len(legislators)} legislators", flush=True)
 
 
-def save_bill(congress: int, bill_type: str, bill_number: int, sponsor_bioguide_id: str,
-              title: str = None, latest_action_text: str = None, latest_action_date: str = None):
+def save_bill(
+    congress: int,
+    bill_type: str,
+    bill_number: int,
+    sponsor_bioguide_id: str,
+    title: str = None,
+    latest_action_text: str = None,
+    latest_action_date: str = None,
+    update_date: str = None,
+):
     """Save or update a bill."""
     bill_id = f"{congress}-{bill_type.lower()}-{bill_number}"
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        now = int(time.time())
         cursor.execute("""
-            INSERT OR REPLACE INTO bills
+            INSERT INTO bills
             (bill_id, congress, bill_type, bill_number, sponsor_bioguide_id,
-             title, latest_action_text, latest_action_date, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             title, latest_action_text, latest_action_date, update_date, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bill_id) DO UPDATE SET
+                congress=excluded.congress,
+                bill_type=excluded.bill_type,
+                bill_number=excluded.bill_number,
+                sponsor_bioguide_id=excluded.sponsor_bioguide_id,
+                title=excluded.title,
+                latest_action_text=excluded.latest_action_text,
+                latest_action_date=excluded.latest_action_date,
+                update_date=excluded.update_date,
+                updated_at=excluded.updated_at
         """, (bill_id, congress, bill_type.lower(), bill_number, sponsor_bioguide_id,
-              title, latest_action_text, latest_action_date, int(time.time())))
+              title, latest_action_text, latest_action_date, update_date, now))
         conn.commit()
 
 
@@ -168,20 +205,37 @@ def save_bills_batch(congress: int, bills: List[Dict[str, Any]]):
             bill_id = f"{congress}-{bill_type}-{bill_number}"
             sponsor = b.get("_sponsor_info") or {}
             latest = b.get("latestAction") or {}
+            update_date = (
+                b.get("_update_date")
+                or b.get("updateDateIncludingText")
+                or b.get("updateDate")
+                or latest.get("actionDate")
+            )
             data.append((
                 bill_id, congress, bill_type, bill_number,
                 sponsor.get("bioguideId"),
                 b.get("title"),
                 latest.get("text"),
                 latest.get("actionDate"),
+                update_date,
                 now
             ))
 
         cursor.executemany("""
-            INSERT OR REPLACE INTO bills
+            INSERT INTO bills
             (bill_id, congress, bill_type, bill_number, sponsor_bioguide_id,
-             title, latest_action_text, latest_action_date, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             title, latest_action_text, latest_action_date, update_date, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bill_id) DO UPDATE SET
+                congress=excluded.congress,
+                bill_type=excluded.bill_type,
+                bill_number=excluded.bill_number,
+                sponsor_bioguide_id=excluded.sponsor_bioguide_id,
+                title=excluded.title,
+                latest_action_text=excluded.latest_action_text,
+                latest_action_date=excluded.latest_action_date,
+                update_date=excluded.update_date,
+                updated_at=excluded.updated_at
         """, data)
         conn.commit()
         print(f"[db] Saved {len(data)} bills for Congress {congress}", flush=True)
@@ -317,6 +371,75 @@ def get_cache_metadata(congress: int) -> Optional[Dict[str, Any]]:
                 "total_laws": row["total_laws"],
             }
         return None
+
+
+def get_bill_cosponsor_refresh_map(congress: int) -> Dict[str, Dict[str, Any]]:
+    """Get per-bill cosponsor refresh metadata."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT bill_id, cosponsors_last_update_date, cosponsors_updated_at
+            FROM bills
+            WHERE congress = ?
+        """, (congress,))
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in cursor.fetchall():
+            out[row["bill_id"]] = {
+                "cosponsors_last_update_date": row["cosponsors_last_update_date"],
+                "cosponsors_updated_at": row["cosponsors_updated_at"],
+            }
+        return out
+
+
+def mark_bill_cosponsors_refreshed(congress: int, bill_updates: Dict[str, Optional[str]]) -> None:
+    """Update cosponsor refresh metadata for bills."""
+    if not bill_updates:
+        return
+    now = int(time.time())
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        with_update = []
+        without_update = []
+        for bill_id, update_date in bill_updates.items():
+            if update_date:
+                with_update.append((update_date, now, bill_id, congress))
+            else:
+                without_update.append((now, bill_id, congress))
+
+        if with_update:
+            cursor.executemany("""
+                UPDATE bills
+                SET cosponsors_last_update_date = ?, cosponsors_updated_at = ?
+                WHERE bill_id = ? AND congress = ?
+            """, with_update)
+        if without_update:
+            cursor.executemany("""
+                UPDATE bills
+                SET cosponsors_updated_at = ?
+                WHERE bill_id = ? AND congress = ?
+            """, without_update)
+        conn.commit()
+
+
+def delete_bill_cosponsors_for_bills(congress: int, bill_ids: List[str]) -> None:
+    """Delete cosponsor records for specific bills."""
+    if not bill_ids:
+        return
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.executemany("""
+            DELETE FROM bill_cosponsors
+            WHERE congress = ? AND bill_id = ?
+        """, [(congress, bill_id) for bill_id in bill_ids])
+        conn.commit()
+
+
+def clear_bill_cosponsors_for_congress(congress: int) -> None:
+    """Delete all cosponsor records for a congress."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM bill_cosponsors WHERE congress = ?", (congress,))
+        conn.commit()
 
 
 def get_stats_from_db(congress: int) -> Optional[Dict[str, Any]]:

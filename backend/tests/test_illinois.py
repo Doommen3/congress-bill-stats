@@ -19,9 +19,11 @@ from illinois_stats import (
     ILNameMatcher,
     parse_members_xml,
     parse_bill_xml,
+    build_il_stats,
     PUBLIC_ACT_PATTERN,
     get_session_years,
     get_available_sessions,
+    load_il_cache,
 )
 
 
@@ -570,6 +572,50 @@ class TestILDatabase:
         assert count == 0
 
 
+class TestILRemoteCache:
+    """Tests for remote cache loading."""
+
+    class DummyResp:
+        def __init__(self, status_code, data):
+            self.status_code = status_code
+            self._data = data
+
+        def json(self):
+            return self._data
+
+    @patch("illinois_stats.il_db.load_il_stats_cache")
+    @patch("illinois_stats.requests.get")
+    def test_load_il_cache_remote_preferred(self, mock_get, mock_db, monkeypatch, tmp_path):
+        """Remote cache should be used when configured."""
+        monkeypatch.setenv("REMOTE_CACHE_BASE_URL", "https://example.com/cache")
+        monkeypatch.setattr("illinois_stats.IL_CACHE_DIR", str(tmp_path))
+        mock_get.return_value = self.DummyResp(200, {"ga_session": 104, "rows": []})
+
+        result = load_il_cache(104)
+
+        assert result is not None
+        assert result["ga_session"] == 104
+        mock_db.assert_not_called()
+
+    @patch("illinois_stats.il_db.load_il_stats_cache")
+    @patch("illinois_stats.requests.get")
+    def test_load_il_cache_remote_fallback_to_file(self, mock_get, mock_db, monkeypatch, tmp_path):
+        """Fallback to local file when remote is missing."""
+        monkeypatch.setenv("REMOTE_CACHE_BASE_URL", "https://example.com/cache")
+        monkeypatch.setattr("illinois_stats.IL_CACHE_DIR", str(tmp_path))
+        mock_get.return_value = self.DummyResp(404, {})
+
+        # Write local cache file
+        fp = tmp_path / "il_stats_104.json"
+        fp.write_text(json.dumps({"ga_session": 104, "rows": [{"memberId": "X"}]}), encoding="utf-8")
+
+        result = load_il_cache(104)
+
+        assert result is not None
+        assert result["ga_session"] == 104
+        mock_db.assert_not_called()
+
+
 class TestILAPIEndpoints:
     """Tests for Illinois API endpoints."""
 
@@ -613,8 +659,9 @@ class TestILAPIEndpoints:
     @patch("illinois_stats.load_il_cache")
     @patch("illinois_stats.build_il_stats")
     @patch("illinois_stats.save_il_cache")
-    def test_il_stats_endpoint_refresh(self, mock_save, mock_build, mock_cache, client):
+    def test_il_stats_endpoint_refresh(self, mock_save, mock_build, mock_cache, client, monkeypatch):
         """Test IL stats endpoint with refresh."""
+        monkeypatch.setenv("ADMIN_IP_ALLOWLIST", "1.2.3.4")
         mock_cache.return_value = None
         mock_build.return_value = {
             "ga_session": 104,
@@ -624,9 +671,107 @@ class TestILAPIEndpoints:
             "summary": {"total_legislators": 0, "total_bills": 0, "total_laws": 0},
         }
 
-        response = client.get("/api/il-stats?session=104&refresh=true")
+        response = client.get(
+            "/api/il-stats?session=104&refresh=true",
+            headers={"x-forwarded-for": "1.2.3.4"},
+        )
         assert response.status_code == 200
         mock_build.assert_called_once()
+
+
+class TestILIncrementalMerge:
+    @patch("illinois_stats.il_db.save_il_legislators_batch")
+    @patch("illinois_stats.il_db.save_il_bills_batch")
+    @patch("illinois_stats.il_db.save_il_laws_batch")
+    @patch("illinois_stats.il_db.save_il_stats_cache")
+    @patch("illinois_stats.il_db.get_all_bills_for_session")
+    @patch("illinois_stats.il_db.get_existing_bill_filenames")
+    @patch("illinois_stats.ILDataFetcher.fetch_bill")
+    @patch("illinois_stats.ILDataFetcher.fetch_bill_list")
+    @patch("illinois_stats.ILDataFetcher.fetch_members")
+    def test_incremental_merge_dedupes_overlapping_bills(
+        self,
+        mock_fetch_members,
+        mock_fetch_bill_list,
+        mock_fetch_bill,
+        mock_existing_files,
+        mock_existing_bills,
+        mock_save_cache,
+        mock_save_laws,
+        mock_save_bills,
+        mock_save_legs,
+    ):
+        members = [
+            {
+                "member_id": "104-house-7",
+                "name": 'Emanuel "Chris" Welch',
+                "first_name": "Emanuel",
+                "last_name": "Welch",
+                "party": "D",
+                "district": 7,
+                "title": "Rep.",
+                "chamber": "house",
+            }
+        ]
+        mock_fetch_members.return_value = (members, [])
+        mock_fetch_bill_list.return_value = ["10400HB0001.xml"]
+        mock_existing_files.return_value = set()
+
+        existing_bill = {
+            "bill_id": "104-hb-1",
+            "bill_type": "hb",
+            "bill_number": 1,
+            "primary_sponsor_name": 'Emanuel "Chris" Welch',
+            "sponsor_name_raw": "Rep. Emanuel Chris Welch",
+            "chief_co_sponsors": "[]",
+            "co_sponsors": "[]",
+            "public_act_number": None,
+        }
+        new_bill = dict(existing_bill)
+        new_bill["latest_action_text"] = "Updated action"
+
+        mock_existing_bills.return_value = [existing_bill]
+        mock_fetch_bill.return_value = new_bill
+
+        stats = build_il_stats(104, incremental=True)
+        rows = {row["memberId"]: row for row in stats["rows"]}
+        assert rows["104-house-7"]["primary_sponsor_total"] == 1
+        assert stats["summary"]["total_bills"] == 1
+
+    @patch("illinois_stats._rebuild_stats_from_db")
+    @patch("illinois_stats.ILDataFetcher.fetch_bill")
+    @patch("illinois_stats.il_db.get_existing_bill_filenames")
+    @patch("illinois_stats.ILDataFetcher.fetch_bill_list")
+    @patch("illinois_stats.ILDataFetcher.fetch_members")
+    def test_incremental_filename_filter_is_case_insensitive(
+        self,
+        mock_fetch_members,
+        mock_fetch_bill_list,
+        mock_existing_files,
+        mock_fetch_bill,
+        mock_rebuild,
+    ):
+        members = [
+            {
+                "member_id": "104-house-7",
+                "name": 'Emanuel "Chris" Welch',
+                "first_name": "Emanuel",
+                "last_name": "Welch",
+                "party": "D",
+                "district": 7,
+                "title": "Rep.",
+                "chamber": "house",
+            }
+        ]
+        mock_fetch_members.return_value = (members, [])
+        mock_fetch_bill_list.return_value = ["10400HB0001.xml"]
+        mock_existing_files.return_value = {"10400HB0001.XML"}
+        mock_rebuild.return_value = {"ga_session": 104, "rows": [], "summary": {"total_bills": 1, "total_laws": 0}}
+
+        stats = build_il_stats(104, incremental=True)
+        assert stats["ga_session"] == 104
+        mock_fetch_bill.assert_not_called()
+        mock_rebuild.assert_called_once()
 
 
 class TestIntegration:

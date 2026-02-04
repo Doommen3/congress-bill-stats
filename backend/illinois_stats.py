@@ -733,9 +733,46 @@ def il_cache_path(ga_session: int) -> str:
     """Get cache file path for Illinois session."""
     return os.path.join(IL_CACHE_DIR, f"il_stats_{ga_session}.json")
 
+def _remote_cache_url(base_url: str, filename: str) -> Optional[str]:
+    if not base_url:
+        return None
+    base = base_url.strip().rstrip("/")
+    if not base:
+        return None
+    return f"{base}/{filename}"
+
+
+def _fetch_remote_cache(base_url: str, filename: str) -> Optional[Dict[str, Any]]:
+    """Fetch cached JSON from a remote URL (e.g., GitHub raw)."""
+    url = _remote_cache_url(base_url, filename)
+    if not url:
+        return None
+    try:
+        resp = requests.get(url, timeout=(5, 20))
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if isinstance(data, dict):
+            return data
+    except (ValueError, RequestException, Timeout, ReqConnErr):
+        return None
+    return None
+
+
+def _il_remote_base_url() -> str:
+    return (
+        os.environ.get("REMOTE_IL_CACHE_BASE_URL")
+        or os.environ.get("REMOTE_CACHE_BASE_URL", "")
+    ).strip()
+
 
 def load_il_cache(ga_session: int) -> Optional[Dict[str, Any]]:
     """Load cached Illinois stats from file or database."""
+    # Try remote cache first (e.g., GitHub raw or object storage)
+    remote = _fetch_remote_cache(_il_remote_base_url(), f"il_stats_{ga_session}.json")
+    if remote:
+        return remote
+
     # Try file cache first
     fp = il_cache_path(ga_session)
     if os.path.exists(fp):
@@ -955,9 +992,9 @@ def build_il_stats(ga_session: int, incremental: bool = True) -> Dict[str, Any]:
 
     # Step 3b: Filter to only new bills if incremental mode
     if incremental:
-        existing_files = il_db.get_existing_bill_filenames(ga_session)
+        existing_files = {f.lower() for f in il_db.get_existing_bill_filenames(ga_session)}
         original_count = len(bill_files)
-        bill_files = [f for f in bill_files if f not in existing_files]
+        bill_files = [f for f in bill_files if f.lower() not in existing_files]
         print(f"[il_build] Incremental mode: {original_count} total, {len(existing_files)} existing, {len(bill_files)} new to fetch", flush=True)
 
         if not bill_files:
@@ -995,8 +1032,22 @@ def build_il_stats(ga_session: int, incremental: bool = True) -> Dict[str, Any]:
     if incremental:
         existing_bills = il_db.get_all_bills_for_session(ga_session)
         print(f"[il_build] Merging with {len(existing_bills)} existing bills from database", flush=True)
-        # Existing bills go first, new bills will be added/updated
-        all_bills = existing_bills + bills
+        # Existing bills go first, new bills override by bill_id.
+        merged_by_id: Dict[str, Dict[str, Any]] = {}
+        for bill in existing_bills:
+            bill_id = bill.get("bill_id")
+            if not bill_id:
+                continue
+            merged_by_id[bill_id] = bill
+        for bill in bills:
+            bill_id = bill.get("bill_id")
+            if not bill_id:
+                continue
+            merged_by_id[bill_id] = bill
+        all_bills = list(merged_by_id.values())
+        removed_duplicates = (len(existing_bills) + len(bills)) - len(all_bills)
+        if removed_duplicates > 0:
+            print(f"[il_build] Deduped {removed_duplicates} overlapping bills during merge", flush=True)
     else:
         all_bills = bills
 

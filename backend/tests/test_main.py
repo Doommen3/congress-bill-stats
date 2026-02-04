@@ -21,6 +21,7 @@ from main import (
     _extract_bills,
     _extract_laws,
     build_law_lookup,
+    load_cache,
 )
 
 
@@ -289,6 +290,12 @@ class TestDatabase:
         assert "laws" in tables
         assert "cache_metadata" in tables
 
+        cursor.execute("PRAGMA table_info(bills)")
+        bill_cols = {row[1] for row in cursor.fetchall()}
+        assert "update_date" in bill_cols
+        assert "cosponsors_last_update_date" in bill_cols
+        assert "cosponsors_updated_at" in bill_cols
+
         conn.close()
 
     def test_save_and_load_legislators(self, temp_db):
@@ -333,6 +340,50 @@ class TestDatabase:
         """Test that cache miss returns None."""
         result = temp_db.load_stats_cache(999)
         assert result is None
+
+
+class TestRemoteCache:
+    """Tests for remote cache loading."""
+
+    class DummyResp:
+        def __init__(self, status_code, data):
+            self.status_code = status_code
+            self._data = data
+
+        def json(self):
+            return self._data
+
+    @patch("main.db.load_stats_cache")
+    @patch("main.requests.get")
+    def test_load_cache_remote_preferred(self, mock_get, mock_db, monkeypatch, tmp_path):
+        """Remote cache should be used when configured."""
+        monkeypatch.setenv("REMOTE_CACHE_BASE_URL", "https://example.com/cache")
+        monkeypatch.setattr("main.CACHE_DIR", str(tmp_path))
+        mock_get.return_value = self.DummyResp(200, {"congress": 119, "rows": []})
+
+        result = load_cache(119)
+
+        assert result is not None
+        assert result["congress"] == 119
+        mock_db.assert_not_called()
+
+    @patch("main.db.load_stats_cache")
+    @patch("main.requests.get")
+    def test_load_cache_remote_fallback_to_file(self, mock_get, mock_db, monkeypatch, tmp_path):
+        """Fallback to local file when remote is missing."""
+        monkeypatch.setenv("REMOTE_CACHE_BASE_URL", "https://example.com/cache")
+        monkeypatch.setattr("main.CACHE_DIR", str(tmp_path))
+        mock_get.return_value = self.DummyResp(404, {})
+
+        # Write local cache file
+        fp = tmp_path / "stats_119.json"
+        fp.write_text(json.dumps({"congress": 119, "rows": [{"bioguideId": "X"}]}), encoding="utf-8")
+
+        result = load_cache(119)
+
+        assert result is not None
+        assert result["congress"] == 119
+        mock_db.assert_not_called()
 
 
 class TestAPIEndpoints:

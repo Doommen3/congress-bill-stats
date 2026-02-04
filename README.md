@@ -46,6 +46,40 @@ uvicorn main:app --reload
   36000–40000 (public law) and 41000–45000 (private law).
 - Counting "passed both chambers" is possible by scanning each bill’s full action history (slower).
 
+## GovInfo Bulk Bill Status Pipeline (Optional, Recommended)
+
+If you want to reduce Congress API calls, you can sync GovInfo Bill Status XML files and use them for sponsor/cosponsor data.
+
+1) Sync bulk XML files locally
+
+```bash
+python backend/sync_billstatus_bulk.py --congress 119 --dest ./cache/billstatus
+```
+
+Optional env vars:
+- `GOVINFO_API_KEY` (or `DATA_GOV_API_KEY`) - optional for bulk sync requests
+- `GOVINFO_BULK_JSON_ROOT` - defaults to `https://www.govinfo.gov/bulkdata/json/BILLSTATUS`
+
+2) Point the app to local bulk XML
+
+```bash
+export BILL_STATUS_BULK_DIR=./cache/billstatus
+```
+
+3) Refresh using bulk source
+
+```bash
+# bulk only
+curl "http://localhost:8000/api/stats?congress=119&refresh=true&cosponsors=full&cosponsor_source=bulk"
+
+# bulk first, API fallback
+curl "http://localhost:8000/api/stats?congress=119&refresh=true&cosponsors=incremental&cosponsor_source=auto"
+```
+
+For cron jobs:
+- `CRON_COSPONSOR_SOURCE=auto|bulk|api`
+- `CRON_SYNC_BILLSTATUS_BULK=1` to sync GovInfo bulk data before rebuilding stats
+
 ## License
 
 MIT
