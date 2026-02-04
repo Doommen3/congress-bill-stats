@@ -991,13 +991,68 @@ def build_il_stats(ga_session: int, incremental: bool = True) -> Dict[str, Any]:
         raise RuntimeError(f"No bill files found for IL GA session {ga_session}")
 
     # Step 3b: Filter to only new bills if incremental mode
+    # Also check pending bills (without public_act_number) for status updates
+    updated_pending_bills = []
     if incremental:
         existing_files = {f.lower() for f in il_db.get_existing_bill_filenames(ga_session)}
         original_count = len(bill_files)
         bill_files = [f for f in bill_files if f.lower() not in existing_files]
         print(f"[il_build] Incremental mode: {original_count} total, {len(existing_files)} existing, {len(bill_files)} new to fetch", flush=True)
 
-        if not bill_files:
+        # Step 3c: Check pending bills for status updates (Option 1 & 2)
+        pending_bills = il_db.get_pending_bills_for_update(ga_session)
+        if pending_bills:
+            print(f"[il_build] Checking {len(pending_bills)} pending bills for status updates...", flush=True)
+
+            # Build lookup of pending bills by filename
+            pending_by_file: Dict[str, Dict[str, Any]] = {}
+            for pb in pending_bills:
+                bill_type = pb["bill_type"].upper()
+                bill_number = pb["bill_number"]
+                filename = f"{ga_session}00{bill_type}{bill_number:04d}.xml"
+                pending_by_file[filename.lower()] = pb
+
+            # Re-fetch pending bills to check for updates
+            pending_files = list(pending_by_file.keys())
+            updates_found = 0
+
+            with ThreadPoolExecutor(max_workers=IL_MAX_WORKERS) as pool:
+                futures = {pool.submit(fetcher.fetch_bill, f): f for f in pending_files}
+                for fut in as_completed(futures):
+                    filename = futures[fut]
+                    try:
+                        new_bill = fut.result()
+                        if not new_bill:
+                            continue
+
+                        old_bill = pending_by_file.get(filename.lower())
+                        if not old_bill:
+                            continue
+
+                        # Option 2: Only update if latest_action_date changed
+                        old_date = old_bill.get("latest_action_date") or ""
+                        new_date = new_bill.get("latest_action_date") or ""
+
+                        if new_date != old_date:
+                            # Bill has been updated - check if it's now enacted
+                            bill_id = new_bill.get("bill_id")
+                            if bill_id:
+                                il_db.update_il_bill(bill_id, {
+                                    "public_act_number": new_bill.get("public_act_number"),
+                                    "latest_action_date": new_date,
+                                    "latest_action_text": new_bill.get("latest_action_text"),
+                                })
+                                updated_pending_bills.append(new_bill)
+                                updates_found += 1
+                                if new_bill.get("public_act_number"):
+                                    print(f"[il_build] Bill {bill_id} is now Public Act {new_bill['public_act_number']}", flush=True)
+
+                    except Exception as e:
+                        print(f"[il_build] Error checking pending bill {filename}: {e}", flush=True)
+
+            print(f"[il_build] Updated {updates_found} pending bills with new status", flush=True)
+
+        if not bill_files and not updated_pending_bills:
             print(f"[il_build] No new bills to fetch, rebuilding stats from database", flush=True)
             # Load existing bills from database and rebuild stats
             return _rebuild_stats_from_db(ga_session, all_members, matcher)
@@ -1033,6 +1088,7 @@ def build_il_stats(ga_session: int, incremental: bool = True) -> Dict[str, Any]:
         existing_bills = il_db.get_all_bills_for_session(ga_session)
         print(f"[il_build] Merging with {len(existing_bills)} existing bills from database", flush=True)
         # Existing bills go first, new bills override by bill_id.
+        # Updated pending bills also override (they have fresh data from server).
         merged_by_id: Dict[str, Dict[str, Any]] = {}
         for bill in existing_bills:
             bill_id = bill.get("bill_id")
@@ -1044,8 +1100,14 @@ def build_il_stats(ga_session: int, incremental: bool = True) -> Dict[str, Any]:
             if not bill_id:
                 continue
             merged_by_id[bill_id] = bill
+        # Include updated pending bills (bills that were re-fetched due to status change)
+        for bill in updated_pending_bills:
+            bill_id = bill.get("bill_id")
+            if not bill_id:
+                continue
+            merged_by_id[bill_id] = bill
         all_bills = list(merged_by_id.values())
-        removed_duplicates = (len(existing_bills) + len(bills)) - len(all_bills)
+        removed_duplicates = (len(existing_bills) + len(bills) + len(updated_pending_bills)) - len(all_bills)
         if removed_duplicates > 0:
             print(f"[il_build] Deduped {removed_duplicates} overlapping bills during merge", flush=True)
     else:

@@ -467,5 +467,62 @@ def get_all_bills_for_session(ga_session: int) -> List[Dict[str, Any]]:
         return [dict(row) for row in cursor.fetchall()]
 
 
+def get_pending_bills_for_update(ga_session: int) -> List[Dict[str, Any]]:
+    """
+    Get bills that may need status updates (no public_act_number yet).
+    Returns bills with their latest_action_date for comparison with server data.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT bill_id, bill_type, bill_number, latest_action_date
+            FROM il_bills
+            WHERE ga_session = ? AND (public_act_number IS NULL OR public_act_number = '')
+        """, (ga_session,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def update_il_bill(bill_id: str, data: Dict[str, Any]) -> None:
+    """
+    Update an existing bill record with new data.
+    Used when re-fetching a bill that may have become a public act.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Build dynamic update query based on provided fields
+        update_fields = []
+        values = []
+
+        allowed_fields = [
+            "public_act_number", "latest_action_date", "latest_action_text",
+            "sponsor_member_id", "primary_sponsor_name", "chief_co_sponsors",
+            "co_sponsors", "title", "synopsis"
+        ]
+
+        for field in allowed_fields:
+            if field in data:
+                update_fields.append(f"{field} = ?")
+                value = data[field]
+                # JSON-encode lists
+                if isinstance(value, list):
+                    value = json.dumps(value)
+                values.append(value)
+
+        if not update_fields:
+            return
+
+        # Add updated_at timestamp
+        update_fields.append("updated_at = ?")
+        values.append(int(time.time()))
+
+        # Add bill_id for WHERE clause
+        values.append(bill_id)
+
+        query = f"UPDATE il_bills SET {', '.join(update_fields)} WHERE bill_id = ?"
+        cursor.execute(query, values)
+        conn.commit()
+
+
 # Initialize IL database tables on module import
 init_il_database()

@@ -680,6 +680,8 @@ class TestILAPIEndpoints:
 
 
 class TestILIncrementalMerge:
+    @patch("illinois_stats.il_db.update_il_bill")
+    @patch("illinois_stats.il_db.get_pending_bills_for_update")
     @patch("illinois_stats.il_db.save_il_legislators_batch")
     @patch("illinois_stats.il_db.save_il_bills_batch")
     @patch("illinois_stats.il_db.save_il_laws_batch")
@@ -700,6 +702,8 @@ class TestILIncrementalMerge:
         mock_save_laws,
         mock_save_bills,
         mock_save_legs,
+        mock_get_pending,
+        mock_update_bill,
     ):
         members = [
             {
@@ -716,6 +720,7 @@ class TestILIncrementalMerge:
         mock_fetch_members.return_value = (members, [])
         mock_fetch_bill_list.return_value = ["10400HB0001.xml"]
         mock_existing_files.return_value = set()
+        mock_get_pending.return_value = []  # No pending bills to check
 
         existing_bill = {
             "bill_id": "104-hb-1",
@@ -739,6 +744,7 @@ class TestILIncrementalMerge:
         assert stats["summary"]["total_bills"] == 1
 
     @patch("illinois_stats._rebuild_stats_from_db")
+    @patch("illinois_stats.il_db.get_pending_bills_for_update")
     @patch("illinois_stats.ILDataFetcher.fetch_bill")
     @patch("illinois_stats.il_db.get_existing_bill_filenames")
     @patch("illinois_stats.ILDataFetcher.fetch_bill_list")
@@ -749,6 +755,7 @@ class TestILIncrementalMerge:
         mock_fetch_bill_list,
         mock_existing_files,
         mock_fetch_bill,
+        mock_get_pending,
         mock_rebuild,
     ):
         members = [
@@ -766,12 +773,272 @@ class TestILIncrementalMerge:
         mock_fetch_members.return_value = (members, [])
         mock_fetch_bill_list.return_value = ["10400HB0001.xml"]
         mock_existing_files.return_value = {"10400HB0001.XML"}
+        mock_get_pending.return_value = []  # No pending bills to check
         mock_rebuild.return_value = {"ga_session": 104, "rows": [], "summary": {"total_bills": 1, "total_laws": 0}}
 
         stats = build_il_stats(104, incremental=True)
         assert stats["ga_session"] == 104
         mock_fetch_bill.assert_not_called()
         mock_rebuild.assert_called_once()
+
+
+class TestBillStatusUpdateLogic:
+    """Tests for re-fetching bills that may have become public acts."""
+
+    @pytest.fixture
+    def temp_db(self, tmp_path):
+        """Create a temporary database for testing."""
+        db_path = str(tmp_path / "test.db")
+        os.environ["DATABASE_PATH"] = db_path
+
+        import importlib
+        import illinois_database
+        importlib.reload(illinois_database)
+
+        yield illinois_database
+
+        if os.path.exists(db_path):
+            os.remove(db_path)
+
+    def test_get_pending_bills_for_update(self, temp_db):
+        """Test that get_pending_bills_for_update returns bills without public_act_number."""
+        # Save some bills - some with public_act_number, some without
+        bills = [
+            {
+                "bill_id": "104-hb-1",
+                "bill_type": "hb",
+                "bill_number": 1,
+                "sponsor_name_raw": "Rep. John Smith",
+                "public_act_number": "104-0001",  # Already enacted
+                "latest_action_date": "06/15/2025",
+            },
+            {
+                "bill_id": "104-hb-2",
+                "bill_type": "hb",
+                "bill_number": 2,
+                "sponsor_name_raw": "Rep. Jane Doe",
+                "public_act_number": None,  # Not enacted - should be returned
+                "latest_action_date": "03/10/2025",
+            },
+            {
+                "bill_id": "104-hb-3",
+                "bill_type": "hb",
+                "bill_number": 3,
+                "sponsor_name_raw": "Rep. Bob Wilson",
+                "public_act_number": None,  # Not enacted - should be returned
+                "latest_action_date": "04/20/2025",
+            },
+        ]
+        temp_db.save_il_bills_batch(104, bills)
+
+        # Get pending bills
+        pending = temp_db.get_pending_bills_for_update(104)
+
+        assert len(pending) == 2
+        bill_ids = {b["bill_id"] for b in pending}
+        assert "104-hb-2" in bill_ids
+        assert "104-hb-3" in bill_ids
+        assert "104-hb-1" not in bill_ids  # Already has public_act_number
+
+    def test_get_pending_bills_includes_action_date(self, temp_db):
+        """Test that pending bills include latest_action_date for comparison."""
+        bills = [
+            {
+                "bill_id": "104-hb-1",
+                "bill_type": "hb",
+                "bill_number": 1,
+                "sponsor_name_raw": "Rep. John Smith",
+                "public_act_number": None,
+                "latest_action_date": "03/10/2025",
+            },
+        ]
+        temp_db.save_il_bills_batch(104, bills)
+
+        pending = temp_db.get_pending_bills_for_update(104)
+
+        assert len(pending) == 1
+        assert pending[0]["latest_action_date"] == "03/10/2025"
+        assert pending[0]["bill_type"] == "hb"
+        assert pending[0]["bill_number"] == 1
+
+    def test_update_il_bill_sets_public_act(self, temp_db):
+        """Test that update_il_bill correctly updates a bill's public_act_number."""
+        # Save initial bill without public_act
+        bills = [
+            {
+                "bill_id": "104-hb-1",
+                "bill_type": "hb",
+                "bill_number": 1,
+                "sponsor_name_raw": "Rep. John Smith",
+                "public_act_number": None,
+                "latest_action_date": "03/10/2025",
+            },
+        ]
+        temp_db.save_il_bills_batch(104, bills)
+
+        # Update the bill with new data
+        temp_db.update_il_bill("104-hb-1", {
+            "public_act_number": "104-0050",
+            "latest_action_date": "06/15/2025",
+            "latest_action_text": "Public Act . . . 104-0050",
+        })
+
+        # Verify update
+        all_bills = temp_db.get_all_bills_for_session(104)
+        assert len(all_bills) == 1
+        assert all_bills[0]["public_act_number"] == "104-0050"
+        assert all_bills[0]["latest_action_date"] == "06/15/2025"
+
+    @patch("illinois_stats.il_db.update_il_bill")
+    @patch("illinois_stats.il_db.get_pending_bills_for_update")
+    @patch("illinois_stats.il_db.save_il_legislators_batch")
+    @patch("illinois_stats.il_db.save_il_bills_batch")
+    @patch("illinois_stats.il_db.save_il_laws_batch")
+    @patch("illinois_stats.il_db.save_il_stats_cache")
+    @patch("illinois_stats.il_db.get_all_bills_for_session")
+    @patch("illinois_stats.il_db.get_existing_bill_filenames")
+    @patch("illinois_stats.ILDataFetcher.fetch_bill")
+    @patch("illinois_stats.ILDataFetcher.fetch_bill_list")
+    @patch("illinois_stats.ILDataFetcher.fetch_members")
+    def test_incremental_refetches_pending_bills_with_changed_date(
+        self,
+        mock_fetch_members,
+        mock_fetch_bill_list,
+        mock_fetch_bill,
+        mock_existing_files,
+        mock_existing_bills,
+        mock_save_cache,
+        mock_save_laws,
+        mock_save_bills,
+        mock_save_legs,
+        mock_get_pending,
+        mock_update_bill,
+    ):
+        """Test that incremental mode re-fetches pending bills when action date changed."""
+        members = [
+            {
+                "member_id": "104-house-1",
+                "name": "John Smith",
+                "first_name": "John",
+                "last_name": "Smith",
+                "party": "D",
+                "district": 1,
+                "chamber": "house",
+            }
+        ]
+        mock_fetch_members.return_value = (members, [])
+        mock_fetch_bill_list.return_value = ["10400HB0001.xml"]
+        mock_existing_files.return_value = {"10400hb0001.xml"}  # Bill already exists
+
+        # Existing bill without public_act_number
+        existing_bill = {
+            "bill_id": "104-hb-1",
+            "bill_type": "hb",
+            "bill_number": 1,
+            "primary_sponsor_name": "John Smith",
+            "sponsor_name_raw": "Rep. John Smith",
+            "chief_co_sponsors": "[]",
+            "co_sponsors": "[]",
+            "public_act_number": None,
+            "latest_action_date": "03/10/2025",  # Old date
+        }
+        mock_existing_bills.return_value = [existing_bill]
+        mock_get_pending.return_value = [existing_bill]
+
+        # Updated bill from server (now enacted, with new date)
+        updated_bill = {
+            "bill_id": "104-hb-1",
+            "bill_type": "hb",
+            "bill_number": 1,
+            "primary_sponsor_name": "John Smith",
+            "sponsor_name_raw": "Rep. John Smith",
+            "chief_co_sponsors": [],
+            "co_sponsors": [],
+            "public_act_number": "104-0001",
+            "latest_action_date": "06/15/2025",  # New date - triggers refetch
+        }
+        mock_fetch_bill.return_value = updated_bill
+
+        stats = build_il_stats(104, incremental=True)
+
+        # Should have re-fetched the bill because date changed
+        # Note: filename is lowercased during processing
+        mock_fetch_bill.assert_called_once_with("10400hb0001.xml")
+        # Should have updated the bill in DB
+        mock_update_bill.assert_called_once()
+
+        # Stats should reflect the enacted bill
+        rows = {row["memberId"]: row for row in stats["rows"]}
+        assert rows["104-house-1"]["enacted_total"] == 1
+
+    @patch("illinois_stats.il_db.update_il_bill")
+    @patch("illinois_stats.il_db.get_pending_bills_for_update")
+    @patch("illinois_stats.il_db.save_il_legislators_batch")
+    @patch("illinois_stats.il_db.save_il_bills_batch")
+    @patch("illinois_stats.il_db.save_il_laws_batch")
+    @patch("illinois_stats.il_db.save_il_stats_cache")
+    @patch("illinois_stats.il_db.get_all_bills_for_session")
+    @patch("illinois_stats.il_db.get_existing_bill_filenames")
+    @patch("illinois_stats.ILDataFetcher.fetch_bill")
+    @patch("illinois_stats.ILDataFetcher.fetch_bill_list")
+    @patch("illinois_stats.ILDataFetcher.fetch_members")
+    def test_incremental_skips_pending_bills_with_same_date(
+        self,
+        mock_fetch_members,
+        mock_fetch_bill_list,
+        mock_fetch_bill,
+        mock_existing_files,
+        mock_existing_bills,
+        mock_save_cache,
+        mock_save_laws,
+        mock_save_bills,
+        mock_save_legs,
+        mock_get_pending,
+        mock_update_bill,
+    ):
+        """Test that incremental mode skips pending bills when action date unchanged."""
+        members = [
+            {
+                "member_id": "104-house-1",
+                "name": "John Smith",
+                "first_name": "John",
+                "last_name": "Smith",
+                "party": "D",
+                "district": 1,
+                "chamber": "house",
+            }
+        ]
+        mock_fetch_members.return_value = (members, [])
+        mock_fetch_bill_list.return_value = ["10400HB0001.xml"]
+        mock_existing_files.return_value = {"10400hb0001.xml"}
+
+        # Existing bill without public_act_number
+        existing_bill = {
+            "bill_id": "104-hb-1",
+            "bill_type": "hb",
+            "bill_number": 1,
+            "primary_sponsor_name": "John Smith",
+            "sponsor_name_raw": "Rep. John Smith",
+            "chief_co_sponsors": "[]",
+            "co_sponsors": "[]",
+            "public_act_number": None,
+            "latest_action_date": "03/10/2025",
+        }
+        mock_existing_bills.return_value = [existing_bill]
+        mock_get_pending.return_value = [existing_bill]
+
+        # Server returns same date - no update needed
+        same_bill = dict(existing_bill)
+        same_bill["chief_co_sponsors"] = []
+        same_bill["co_sponsors"] = []
+        mock_fetch_bill.return_value = same_bill
+
+        stats = build_il_stats(104, incremental=True)
+
+        # Should have fetched to check the date
+        mock_fetch_bill.assert_called_once()
+        # But should NOT have called update since date is the same
+        mock_update_bill.assert_not_called()
 
 
 class TestIntegration:
